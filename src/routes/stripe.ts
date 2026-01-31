@@ -97,12 +97,13 @@ router.post("/init-checkout", async (req: Request, res: Response) => {
   }
 
   try {
-    // Get user with Fiken token (to get organization number)
+    // Get user with accounting connection (to get organization number)
     const user = await prisma.user.findUnique({
       where: { id: userId },
       include: {
-        fikenToken: {
+        accountingConnections: {
           select: {
+            provider: true,
             organizationNumber: true,
             companyName: true,
           },
@@ -115,13 +116,18 @@ router.post("/init-checkout", async (req: Request, res: Response) => {
       return;
     }
 
+    // Get active connection for company info
+    const activeConnection = user.accountingConnections.find(
+      (c) => c.provider === "fiken"
+    ) || user.accountingConnections[0];
+
     // Create or get Stripe customer
     let customerId = user.stripeCustomerId;
 
     if (!customerId) {
       const customer = await stripe.customers.create({
         email: user.email,
-        name: user.fikenToken?.companyName || user.name || undefined,
+        name: activeConnection?.companyName || user.name || undefined,
         metadata: {
           userId: user.id,
         },
@@ -136,7 +142,7 @@ router.post("/init-checkout", async (req: Request, res: Response) => {
     }
 
     // Add Tax ID if organization number is available
-    const organizationNumber = user.fikenToken?.organizationNumber;
+    const organizationNumber = activeConnection?.organizationNumber;
     if (organizationNumber) {
       try {
         // Check if tax ID already exists

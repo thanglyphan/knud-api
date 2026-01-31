@@ -3,14 +3,16 @@ import cors from "cors";
 import { openai } from "@ai-sdk/openai";
 import { streamText } from "ai";
 import dotenv from "dotenv";
-import { ACCOUNTING_SYSTEM_PROMPT, FIKEN_SYSTEM_PROMPT } from "./prompts.js";
+import { ACCOUNTING_SYSTEM_PROMPT, FIKEN_SYSTEM_PROMPT, TRIPLETEX_SYSTEM_PROMPT } from "./prompts.js";
 import { prisma } from "./db.js";
 import chatRoutes from "./routes/chat.js";
 import authRoutes from "./routes/auth.js";
 import stripeRoutes, { handleWebhook } from "./routes/stripe.js";
-import { requireAuth, requireFikenConnection } from "./middleware/auth.js";
+import { requireAuth, requireAccountingConnection } from "./middleware/auth.js";
 import { createFikenClient } from "./fiken/client.js";
 import { createFikenTools } from "./fiken/tools/index.js";
+import { createTripletexClient } from "./tripletex/client.js";
+import { createTripletexCapabilities } from "./tripletex/capabilities/index.js";
 import type { ChatRequest } from "./types.js";
 
 dotenv.config();
@@ -57,19 +59,32 @@ app.use("/api/stripe", stripeRoutes);
 // Chat CRUD routes
 app.use("/api/chats", chatRoutes);
 
-// Financial summary endpoint (requires auth + Fiken connection)
-app.get("/api/financial-summary", requireAuth, requireFikenConnection, async (req, res) => {
+// Financial summary endpoint (requires auth + accounting connection)
+app.get("/api/financial-summary", requireAuth, requireAccountingConnection, async (req, res) => {
   try {
-    // Create Fiken client for this user
-    const fikenClient = createFikenClient(req.fikenAccessToken!, req.companySlug!);
+    const provider = req.accountingProvider;
     
-    // Get current year date range
-    const year = new Date().getFullYear();
-    const fromDate = `${year}-01-01`;
-    const toDate = new Date().toISOString().split("T")[0];
-    
-    const summary = await fikenClient.getFinancialSummary(fromDate, toDate);
-    res.json(summary);
+    if (provider === "fiken") {
+      // Create Fiken client for this user
+      const fikenClient = createFikenClient(req.accountingAccessToken!, req.companyId!);
+      
+      // Get current year date range
+      const year = new Date().getFullYear();
+      const fromDate = `${year}-01-01`;
+      const toDate = new Date().toISOString().split("T")[0];
+      
+      const summary = await fikenClient.getFinancialSummary(fromDate, toDate);
+      res.json(summary);
+    } else if (provider === "tripletex") {
+      // Tripletex doesn't have a direct financial summary endpoint
+      // TODO: Implement aggregated summary from Tripletex data
+      res.json({
+        message: "Finansoversikt er ikke tilgjengelig for Tripletex ennå",
+        provider: "tripletex",
+      });
+    } else {
+      res.status(400).json({ error: "Ukjent regnskapssystem" });
+    }
   } catch (error) {
     console.error("Financial summary error:", error);
     res.status(500).json({ 
@@ -78,8 +93,9 @@ app.get("/api/financial-summary", requireAuth, requireFikenConnection, async (re
   }
 });
 
-// Chat endpoint with Fiken integration (requires auth + Fiken connection)
-app.post("/api/chat", requireAuth, requireFikenConnection, async (req, res) => {
+// Chat endpoint with accounting integration (requires auth + accounting connection)
+// Supports both Fiken and Tripletex based on user's activeProvider
+app.post("/api/chat", requireAuth, requireAccountingConnection, async (req, res) => {
   try {
     const { messages, chatId, file } = req.body as ChatRequest & { 
       chatId?: string;
@@ -91,14 +107,12 @@ app.post("/api/chat", requireAuth, requireFikenConnection, async (req, res) => {
       return;
     }
 
+    const provider = req.accountingProvider;
+
     // Log file info for debugging
     if (file) {
       console.log("File attached:", { name: file.name, type: file.type, dataLength: file.data?.length });
     }
-
-    // Create Fiken client for this user
-    const fikenClient = createFikenClient(req.fikenAccessToken!, req.companySlug!);
-    const fikenTools = createFikenTools(fikenClient, req.companySlug!, file);
 
     // Get current date in Norwegian format
     const today = new Date();
@@ -110,8 +124,32 @@ app.post("/api/chat", requireAuth, requireFikenConnection, async (req, res) => {
     });
     const isoDate = today.toISOString().split("T")[0];
     
+    // Initialize provider-specific variables
+    let tools;
+    let baseSystemPrompt: string;
+    
+    if (provider === "fiken") {
+      // Create Fiken client and tools
+      const fikenClient = createFikenClient(req.accountingAccessToken!, req.companyId!);
+      tools = createFikenTools(fikenClient, req.companyId!, file);
+      baseSystemPrompt = FIKEN_SYSTEM_PROMPT;
+    } else if (provider === "tripletex") {
+      // Create Tripletex client and capabilities
+      const tripletexClient = createTripletexClient(req.accountingAccessToken!, req.companyId!);
+      
+      // Create Tripletex capabilities (capability-based architecture: 2 tools instead of 29)
+      tools = createTripletexCapabilities(tripletexClient);
+      
+      console.log(`[Tripletex] Loaded ${Object.keys(tools).length} capabilities: ${Object.keys(tools).join(", ")}`);
+      
+      baseSystemPrompt = TRIPLETEX_SYSTEM_PROMPT;
+    } else {
+      res.status(400).json({ error: "Ukjent regnskapssystem" });
+      return;
+    }
+
     // Add current date to system prompt
-    let systemPromptWithDate = `${FIKEN_SYSTEM_PROMPT}
+    let systemPromptWithDate = `${baseSystemPrompt}
 
 ## DAGENS DATO
 I dag er ${dateStr} (${isoDate}).
@@ -119,7 +157,8 @@ Bruk denne datoen som referanse for alle datoer (f.eks. "i dag", "denne måneden
 
     // If there's a file attached, tell the AI about it
     if (file) {
-      systemPromptWithDate += `
+      if (provider === "fiken") {
+        systemPromptWithDate += `
 
 ## VEDLAGT FIL - HANDLING PÅKREVD!
 Brukeren har vedlagt en fil til DENNE meldingen:
@@ -131,6 +170,20 @@ Brukeren har vedlagt en fil til DENNE meldingen:
 2. Deretter: Last opp filen med uploadAttachmentToPurchase(purchaseId), uploadAttachmentToSale(saleId), etc.
 
 IKKE spør brukeren om å sende filen på nytt - filen ER allerede vedlagt og klar til opplasting!`;
+      } else if (provider === "tripletex") {
+        systemPromptWithDate += `
+
+## VEDLAGT FIL - HANDLING PÅKREVD!
+Brukeren har vedlagt en fil til DENNE meldingen:
+- Filnavn: ${file.name}
+- Filtype: ${file.type}
+
+**DU MÅ LASTE OPP DENNE FILEN!** Følg disse stegene:
+1. Først: Opprett leverandørfakturaen/ordren/bilaget med riktig verktøy
+2. Deretter: Last opp dokumentet med uploadDocument-verktøyet
+
+IKKE spør brukeren om å sende filen på nytt - filen ER allerede vedlagt og klar til opplasting!`;
+      }
     }
 
     // Set headers for streaming
@@ -145,10 +198,18 @@ IKKE spør brukeren om å sende filen på nytt - filen ER allerede vedlagt og kl
         role: msg.role as "user" | "assistant",
         content: msg.content,
       })),
-      tools: fikenTools,
+      tools,
       maxSteps: 10,
       toolChoice: "auto", // Ensure tool calling is enabled
-
+      onStepFinish: ({ stepType, toolCalls, toolResults }) => {
+        console.log(`[AI] Step finished: ${stepType}`);
+        if (toolCalls && toolCalls.length > 0) {
+          console.log(`[AI] Tool calls:`, JSON.stringify(toolCalls, null, 2));
+        }
+        if (toolResults && toolResults.length > 0) {
+          console.log(`[AI] Tool results:`, JSON.stringify(toolResults, null, 2).substring(0, 1000));
+        }
+      },
     });
 
     // Stream the response using Vercel AI SDK format
@@ -402,11 +463,11 @@ process.on("SIGTERM", async () => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Regnskap API running on http://localhost:${PORT}`);
+  console.log(`Knud API running on http://localhost:${PORT}`);
   console.log(`Health check: http://localhost:${PORT}/health`);
   console.log(`Auth endpoints: http://localhost:${PORT}/api/auth/*`);
   console.log(`Stripe endpoints: http://localhost:${PORT}/api/stripe/*`);
-  console.log(`Chat endpoint (with Fiken): POST http://localhost:${PORT}/api/chat`);
+  console.log(`Chat endpoint (with Fiken/Tripletex): POST http://localhost:${PORT}/api/chat`);
   console.log(`Chat endpoint (simple): POST http://localhost:${PORT}/api/chat/simple`);
   console.log(`Chats CRUD: http://localhost:${PORT}/api/chats`);
 });

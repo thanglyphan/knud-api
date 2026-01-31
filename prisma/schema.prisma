@@ -7,7 +7,7 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// Bruker som logger inn via Fiken OAuth2
+// Bruker som logger inn via regnskapssystem
 model User {
   id        String   @id @default(uuid())
   email     String   @unique
@@ -23,31 +23,39 @@ model User {
   subscriptionStarted DateTime?
   subscriptionEnds    DateTime?
 
+  // Aktivt regnskapssystem
+  activeProvider String? // "fiken" | "tripletex"
+
   // Relasjoner
-  fikenToken FikenToken?
-  chats      Chat[]
+  accountingConnections AccountingConnection[]
+  chats                 Chat[]
 
   @@index([email])
 }
 
-// Fiken OAuth2 tokens for en bruker
-model FikenToken {
-  id           String   @id @default(uuid())
-  userId       String   @unique
-  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  
-  accessToken  String
-  refreshToken String
-  expiresAt    DateTime
-  
-  // Hvilket selskap brukeren har valgt (slug fra Fiken)
-  companySlug        String?
+// Tilkobling til regnskapssystem (Fiken eller Tripletex)
+model AccountingConnection {
+  id       String @id @default(uuid())
+  userId   String
+  provider String // "fiken" | "tripletex"
+
+  // Tokens
+  accessToken   String // Fiken: access_token, Tripletex: session_token
+  refreshToken  String? // Kun Fiken
+  employeeToken String? // Kun Tripletex (for å opprette ny session)
+  expiresAt     DateTime
+
+  // Valgt selskap
+  companyId          String? // Fiken: slug, Tripletex: numeric ID
   companyName        String?
   organizationNumber String?
-  
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
 
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, provider])
   @@index([userId])
 }
 

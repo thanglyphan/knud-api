@@ -1,6 +1,8 @@
 /**
  * Fiken OAuth2 Authentication
  * Handles the OAuth2 flow for Fiken API
+ *
+ * Oppdatert til å bruke AccountingConnection-modellen
  */
 
 import { prisma } from "../db.js";
@@ -144,27 +146,42 @@ export async function getFikenUserInfo(accessToken: string): Promise<FikenUserIn
  * Get a valid access token for a user, refreshing if necessary
  */
 export async function getValidAccessToken(userId: string): Promise<string | null> {
-  const token = await prisma.fikenToken.findUnique({
-    where: { userId },
+  const connection = await prisma.accountingConnection.findUnique({
+    where: {
+      userId_provider: {
+        userId,
+        provider: "fiken",
+      },
+    },
   });
 
-  if (!token) {
+  if (!connection) {
     return null;
   }
 
   // Check if token is expired (with 5 minute buffer)
   const now = new Date();
-  const expiresAt = new Date(token.expiresAt);
+  const expiresAt = new Date(connection.expiresAt);
   const bufferMs = 5 * 60 * 1000; // 5 minutes
 
   if (now.getTime() + bufferMs >= expiresAt.getTime()) {
     // Token is expired or about to expire, refresh it
+    if (!connection.refreshToken) {
+      console.error("No refresh token stored for Fiken");
+      return null;
+    }
+
     try {
-      const newTokens = await refreshAccessToken(token.refreshToken);
-      
+      const newTokens = await refreshAccessToken(connection.refreshToken);
+
       // Update tokens in database
-      await prisma.fikenToken.update({
-        where: { userId },
+      await prisma.accountingConnection.update({
+        where: {
+          userId_provider: {
+            userId,
+            provider: "fiken",
+          },
+        },
         data: {
           accessToken: newTokens.access_token,
           refreshToken: newTokens.refresh_token,
@@ -175,13 +192,20 @@ export async function getValidAccessToken(userId: string): Promise<string | null
       return newTokens.access_token;
     } catch (error) {
       console.error("Failed to refresh Fiken token:", error);
-      // Delete invalid token
-      await prisma.fikenToken.delete({ where: { userId } });
+      // Delete invalid connection
+      await prisma.accountingConnection.delete({
+        where: {
+          userId_provider: {
+            userId,
+            provider: "fiken",
+          },
+        },
+      });
       return null;
     }
   }
 
-  return token.accessToken;
+  return connection.accessToken;
 }
 
 /**
@@ -191,27 +215,42 @@ export async function saveFikenTokens(
   userId: string,
   tokens: TokenResponse,
   companySlug?: string,
-  companyName?: string
+  companyName?: string,
+  organizationNumber?: string
 ): Promise<void> {
   const expiresAt = new Date(Date.now() + tokens.expires_in * 1000);
 
-  await prisma.fikenToken.upsert({
-    where: { userId },
+  await prisma.accountingConnection.upsert({
+    where: {
+      userId_provider: {
+        userId,
+        provider: "fiken",
+      },
+    },
     create: {
       userId,
+      provider: "fiken",
       accessToken: tokens.access_token,
       refreshToken: tokens.refresh_token,
       expiresAt,
-      companySlug,
+      companyId: companySlug,
       companyName,
+      organizationNumber,
     },
     update: {
       accessToken: tokens.access_token,
       refreshToken: tokens.refresh_token,
       expiresAt,
-      companySlug: companySlug ?? undefined,
+      companyId: companySlug ?? undefined,
       companyName: companyName ?? undefined,
+      organizationNumber: organizationNumber ?? undefined,
     },
+  });
+
+  // Set Fiken as active provider
+  await prisma.user.update({
+    where: { id: userId },
+    data: { activeProvider: "fiken" },
   });
 }
 
@@ -219,12 +258,17 @@ export async function saveFikenTokens(
  * Get user's selected company slug
  */
 export async function getUserCompanySlug(userId: string): Promise<string | null> {
-  const token = await prisma.fikenToken.findUnique({
-    where: { userId },
-    select: { companySlug: true },
+  const connection = await prisma.accountingConnection.findUnique({
+    where: {
+      userId_provider: {
+        userId,
+        provider: "fiken",
+      },
+    },
+    select: { companyId: true },
   });
 
-  return token?.companySlug || null;
+  return connection?.companyId || null;
 }
 
 /**
@@ -233,10 +277,42 @@ export async function getUserCompanySlug(userId: string): Promise<string | null>
 export async function setUserCompany(
   userId: string,
   companySlug: string,
-  companyName: string
+  companyName: string,
+  organizationNumber?: string
 ): Promise<void> {
-  await prisma.fikenToken.update({
-    where: { userId },
-    data: { companySlug, companyName },
+  await prisma.accountingConnection.update({
+    where: {
+      userId_provider: {
+        userId,
+        provider: "fiken",
+      },
+    },
+    data: { companyId: companySlug, companyName, organizationNumber },
+  });
+}
+
+/**
+ * Get Fiken connection for a user
+ */
+export async function getFikenConnection(userId: string) {
+  return prisma.accountingConnection.findUnique({
+    where: {
+      userId_provider: {
+        userId,
+        provider: "fiken",
+      },
+    },
+  });
+}
+
+/**
+ * Delete Fiken connection for a user
+ */
+export async function deleteFikenConnection(userId: string): Promise<void> {
+  await prisma.accountingConnection.deleteMany({
+    where: {
+      userId,
+      provider: "fiken",
+    },
   });
 }

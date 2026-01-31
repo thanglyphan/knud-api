@@ -1,10 +1,12 @@
 /**
  * Authentication middleware
+ * Updated to support multiple accounting providers
  */
 
 import { Request, Response, NextFunction } from "express";
 import { prisma } from "../db.js";
-import { getValidAccessToken } from "../fiken/auth.js";
+import { getValidAccessToken as getFikenAccessToken } from "../fiken/auth.js";
+import { getValidSessionToken as getTripletexSessionToken } from "../tripletex/auth.js";
 
 // Extend Express Request type
 declare global {
@@ -15,9 +17,15 @@ declare global {
         id: string;
         email: string;
         name: string | null;
+        activeProvider?: string | null;
       };
+      // Legacy Fiken fields (for backward compatibility)
       fikenAccessToken?: string;
       companySlug?: string;
+      // Provider-agnostic fields
+      accountingProvider?: string;
+      accountingAccessToken?: string;
+      companyId?: string;
     }
   }
 }
@@ -44,9 +52,10 @@ export async function requireAuth(
     const user = await prisma.user.findUnique({
       where: { id: userId },
       include: {
-        fikenToken: {
+        accountingConnections: {
           select: {
-            companySlug: true,
+            provider: true,
+            companyId: true,
           },
         },
       },
@@ -57,13 +66,22 @@ export async function requireAuth(
       return;
     }
 
+    // Find active connection
+    const activeConnection = user.accountingConnections.find(
+      (c) => c.provider === user.activeProvider
+    );
+
     req.userId = user.id;
     req.user = {
       id: user.id,
       email: user.email,
       name: user.name,
+      activeProvider: user.activeProvider,
     };
-    req.companySlug = user.fikenToken?.companySlug || undefined;
+    req.accountingProvider = user.activeProvider || undefined;
+    req.companyId = activeConnection?.companyId || undefined;
+    // Legacy support
+    req.companySlug = activeConnection?.companyId || undefined;
 
     next();
   } catch (error) {
@@ -73,10 +91,10 @@ export async function requireAuth(
 }
 
 /**
- * Middleware to require valid Fiken connection
- * Also fetches and validates access token
+ * Middleware to require valid accounting connection
+ * Works with both Fiken and Tripletex
  */
-export async function requireFikenConnection(
+export async function requireAccountingConnection(
   req: Request,
   res: Response,
   next: NextFunction
@@ -86,39 +104,86 @@ export async function requireFikenConnection(
     return;
   }
 
+  const provider = req.accountingProvider;
+
+  if (!provider) {
+    res.status(401).json({
+      error: "No accounting system connected",
+      code: "NO_PROVIDER_CONNECTED",
+    });
+    return;
+  }
+
   try {
-    const accessToken = await getValidAccessToken(req.userId);
+    let accessToken: string | null = null;
+
+    if (provider === "fiken") {
+      accessToken = await getFikenAccessToken(req.userId);
+    } else if (provider === "tripletex") {
+      accessToken = await getTripletexSessionToken(req.userId);
+    }
 
     if (!accessToken) {
-      res.status(401).json({ 
-        error: "Fiken connection required",
-        code: "FIKEN_NOT_CONNECTED"
+      res.status(401).json({
+        error: `${provider} connection expired or invalid`,
+        code: "CONNECTION_EXPIRED",
       });
       return;
     }
 
     // Check if company is selected
-    const token = await prisma.fikenToken.findUnique({
-      where: { userId: req.userId },
-      select: { companySlug: true },
+    const connection = await prisma.accountingConnection.findUnique({
+      where: {
+        userId_provider: {
+          userId: req.userId,
+          provider,
+        },
+      },
+      select: { companyId: true },
     });
 
-    if (!token?.companySlug) {
-      res.status(400).json({ 
+    if (!connection?.companyId) {
+      res.status(400).json({
         error: "No company selected",
-        code: "NO_COMPANY_SELECTED"
+        code: "NO_COMPANY_SELECTED",
       });
       return;
     }
 
-    req.fikenAccessToken = accessToken;
-    req.companySlug = token.companySlug;
+    req.accountingAccessToken = accessToken;
+    req.companyId = connection.companyId;
+    // Legacy support for Fiken
+    req.fikenAccessToken = provider === "fiken" ? accessToken : undefined;
+    req.companySlug = provider === "fiken" ? connection.companyId : undefined;
+
+    console.log(`[Auth] Provider: ${provider}, CompanyId: ${connection.companyId}, Token: ${accessToken?.substring(0, 15)}...`);
 
     next();
   } catch (error) {
-    console.error("Fiken connection middleware error:", error);
-    res.status(500).json({ error: "Failed to verify Fiken connection" });
+    console.error("Accounting connection middleware error:", error);
+    res.status(500).json({ error: "Failed to verify accounting connection" });
   }
+}
+
+/**
+ * Legacy middleware - redirects to new middleware
+ * @deprecated Use requireAccountingConnection instead
+ */
+export async function requireFikenConnection(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  // Force Fiken provider for legacy endpoints
+  if (req.accountingProvider !== "fiken") {
+    res.status(400).json({
+      error: "This endpoint requires Fiken connection",
+      code: "FIKEN_REQUIRED",
+    });
+    return;
+  }
+
+  return requireAccountingConnection(req, res, next);
 }
 
 /**
@@ -142,22 +207,30 @@ export async function optionalAuth(
     const user = await prisma.user.findUnique({
       where: { id: userId },
       include: {
-        fikenToken: {
+        accountingConnections: {
           select: {
-            companySlug: true,
+            provider: true,
+            companyId: true,
           },
         },
       },
     });
 
     if (user) {
+      const activeConnection = user.accountingConnections.find(
+        (c) => c.provider === user.activeProvider
+      );
+
       req.userId = user.id;
       req.user = {
         id: user.id,
         email: user.email,
         name: user.name,
+        activeProvider: user.activeProvider,
       };
-      req.companySlug = user.fikenToken?.companySlug || undefined;
+      req.accountingProvider = user.activeProvider || undefined;
+      req.companyId = activeConnection?.companyId || undefined;
+      req.companySlug = activeConnection?.companyId || undefined;
     }
   } catch (error) {
     // Ignore errors in optional auth

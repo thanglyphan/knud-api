@@ -1,12 +1,19 @@
 import { Router } from "express";
 import { prisma } from "../db.js";
+import { requireAuth } from "../middleware/auth.js";
 
 const router = Router();
 
-// GET /api/chats - List all chats
-router.get("/", async (_req, res) => {
+// All chat routes require authentication
+router.use(requireAuth);
+
+// GET /api/chats - List all chats for the authenticated user
+router.get("/", async (req, res) => {
   try {
+    const userId = req.userId!;
+
     const chats = await prisma.chat.findMany({
+      where: { userId },
       orderBy: { createdAt: "desc" },
       select: {
         id: true,
@@ -26,13 +33,17 @@ router.get("/", async (_req, res) => {
   }
 });
 
-// GET /api/chats/:id - Get a single chat with messages
+// GET /api/chats/:id - Get a single chat with messages (only if owned by user)
 router.get("/:id", async (req, res) => {
   try {
     const { id } = req.params;
+    const userId = req.userId!;
 
-    const chat = await prisma.chat.findUnique({
-      where: { id },
+    const chat = await prisma.chat.findFirst({
+      where: { 
+        id,
+        userId, // Only return if owned by user
+      },
       include: {
         messages: {
           orderBy: { createdAt: "asc" },
@@ -52,15 +63,16 @@ router.get("/:id", async (req, res) => {
   }
 });
 
-// POST /api/chats - Create a new chat
+// POST /api/chats - Create a new chat (automatically assigned to authenticated user)
 router.post("/", async (req, res) => {
   try {
-    const { title, userId } = req.body;
+    const { title } = req.body;
+    const userId = req.userId!;
 
     const chat = await prisma.chat.create({
       data: {
         title: title || "Ny samtale",
-        userId: userId || null,
+        userId, // Always use authenticated user's ID
       },
     });
 
@@ -71,11 +83,22 @@ router.post("/", async (req, res) => {
   }
 });
 
-// PATCH /api/chats/:id - Update a chat (e.g., title)
+// PATCH /api/chats/:id - Update a chat (only if owned by user)
 router.patch("/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const { title } = req.body;
+    const userId = req.userId!;
+
+    // First check if user owns this chat
+    const existingChat = await prisma.chat.findFirst({
+      where: { id, userId },
+    });
+
+    if (!existingChat) {
+      res.status(404).json({ error: "Chat not found" });
+      return;
+    }
 
     const chat = await prisma.chat.update({
       where: { id },
@@ -89,10 +112,21 @@ router.patch("/:id", async (req, res) => {
   }
 });
 
-// DELETE /api/chats/:id - Delete a chat
+// DELETE /api/chats/:id - Delete a chat (only if owned by user)
 router.delete("/:id", async (req, res) => {
   try {
     const { id } = req.params;
+    const userId = req.userId!;
+
+    // First check if user owns this chat
+    const existingChat = await prisma.chat.findFirst({
+      where: { id, userId },
+    });
+
+    if (!existingChat) {
+      res.status(404).json({ error: "Chat not found" });
+      return;
+    }
 
     await prisma.chat.delete({
       where: { id },
@@ -105,14 +139,25 @@ router.delete("/:id", async (req, res) => {
   }
 });
 
-// POST /api/chats/:id/messages - Add a message to a chat
+// POST /api/chats/:id/messages - Add a message to a chat (only if owned by user)
 router.post("/:id/messages", async (req, res) => {
   try {
     const { id } = req.params;
     const { role, content } = req.body;
+    const userId = req.userId!;
 
     if (!role || !content) {
       res.status(400).json({ error: "Role and content are required" });
+      return;
+    }
+
+    // First check if user owns this chat
+    const existingChat = await prisma.chat.findFirst({
+      where: { id, userId },
+    });
+
+    if (!existingChat) {
+      res.status(404).json({ error: "Chat not found" });
       return;
     }
 
@@ -137,14 +182,25 @@ router.post("/:id/messages", async (req, res) => {
   }
 });
 
-// POST /api/chats/:id/messages/batch - Add multiple messages at once
+// POST /api/chats/:id/messages/batch - Add multiple messages at once (only if owned by user)
 router.post("/:id/messages/batch", async (req, res) => {
   try {
     const { id } = req.params;
     const { messages } = req.body;
+    const userId = req.userId!;
 
     if (!messages || !Array.isArray(messages)) {
       res.status(400).json({ error: "Messages array is required" });
+      return;
+    }
+
+    // First check if user owns this chat
+    const existingChat = await prisma.chat.findFirst({
+      where: { id, userId },
+    });
+
+    if (!existingChat) {
+      res.status(404).json({ error: "Chat not found" });
       return;
     }
 
