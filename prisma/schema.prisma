@@ -1,0 +1,77 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Bruker som logger inn via Fiken OAuth2
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  name      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Stripe
+  stripeCustomerId String? @unique
+
+  // Subscription
+  subscriptionStatus  String    @default("none") // "none" | "active" | "cancelled" | "expired"
+  subscriptionStarted DateTime?
+  subscriptionEnds    DateTime?
+
+  // Relasjoner
+  fikenToken FikenToken?
+  chats      Chat[]
+
+  @@index([email])
+}
+
+// Fiken OAuth2 tokens for en bruker
+model FikenToken {
+  id           String   @id @default(uuid())
+  userId       String   @unique
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  accessToken  String
+  refreshToken String
+  expiresAt    DateTime
+  
+  // Hvilket selskap brukeren har valgt (slug fra Fiken)
+  companySlug        String?
+  companyName        String?
+  organizationNumber String?
+  
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([userId])
+}
+
+model Chat {
+  id        String    @id @default(uuid())
+  title     String
+  userId    String?
+  user      User?     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  messages  Message[]
+
+  @@index([userId])
+  @@index([createdAt])
+}
+
+model Message {
+  id        String   @id @default(uuid())
+  role      String   // "user" | "assistant"
+  content   String
+  createdAt DateTime @default(now())
+  chat      Chat     @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  chatId    String
+
+  @@index([chatId])
+  @@index([createdAt])
+}
