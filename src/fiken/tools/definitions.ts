@@ -2023,7 +2023,12 @@ ARBEIDSFLYT:
 2. VIS de 3 forslagene til brukeren (inkludert reason, MVA-info og vatNote)
 3. Hvis vatNote finnes - FØLG instruksjonen (f.eks. spør om innenlands/utenlands)
 4. VENT på brukerens valg (1, 2 eller 3) OG svar på eventuelle oppfølgingsspørsmål
-5. Spør om beløpet er inkl. eller ekskl. MVA - KUN hvis dette IKKE allerede er kjent (fra kvittering, brukerens melding, eller tidligere i samtalen)
+5. ⛔ MVA-REGEL - IKKE spør om inkl/ekskl MVA hvis:
+   - Brukeren har skrevet "inkl. MVA", "(inkl. 25% MVA)" eller lignende
+   - Brukeren har oppgitt MVA-beløp (f.eks. "MVA: 107 kr")
+   - Du har lest MVA-info fra kvittering/faktura
+   → I disse tilfellene VET DU ALLEREDE SVARET - ikke spør!
+   → KUN spør hvis MVA-info er HELT ukjent
 6. Registrer med valgt konto og riktig MVA-behandling
 
 Verktøyet returnerer:
@@ -2058,7 +2063,7 @@ Verktøyet returnerer:
             vatNote: s.vatNote,
           })),
           searchDescription: result.searchDescription,
-          message: "Vis forslagene til brukeren. VIKTIG: Hvis vatNote finnes, FØLG instruksjonen (spør oppfølgingsspørsmål). Spør om inkl/ekskl MVA KUN hvis dette ikke allerede er oppgitt eller kjent.",
+          message: "Vis forslagene til brukeren. Hvis vatNote finnes, FØLG instruksjonen. ⛔ IKKE spør om inkl/ekskl MVA hvis allerede oppgitt! 📌 Etter kontovalg: Bruk getBankAccounts og spør hvilken bankkonto betalingen gikk fra!",
         };
       } catch (error) {
         console.error("suggestAccounts error:", error);

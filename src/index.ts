@@ -225,7 +225,7 @@ IKKE spør brukeren om å sende fil${files.length > 1 ? 'ene' : 'en'} på nytt -
           > = [
             { 
               type: "text", 
-              text: `${textContent}\n\n📎 **Vedlagte filer (${files.length} stk):** ${fileNames}\n[ANALYSER bildet/bildene og les av informasjon fra kvitteringen. Spør ALLTID "Stemmer dette?" før registrering.]` 
+              text: `${textContent}\n\n📎 **Vedlagte filer (${files.length} stk):** ${fileNames}\n[ANALYSER bildet/bildene og les av informasjon. Identifiser: leverandør, dato, beløp, MVA, beskrivelse. VIKTIG: Sjekk om det er BETALT (kvittering/kortbetaling) eller UBETALT (forfallsdato/faktura). Spør ALLTID "Stemmer dette?" før registrering. ⛔ IKKE spør om inkl/ekskl MVA hvis du ser MVA-info! 📌 ALLTID spør hvilken bankkonto betalingen gikk fra!]` 
             }
           ];
           
