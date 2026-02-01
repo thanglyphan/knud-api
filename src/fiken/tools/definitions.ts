@@ -2672,11 +2672,12 @@ Verktøyet returnerer:
   // ============================================
 
   const uploadAttachmentToPurchase = tool({
-    description: "Last opp ALLE vedlagte filer (kvitteringer/fakturaer) til et kjøp. Brukes etter createPurchase for å legge ved dokumentasjon. Laster opp alle filer automatisk i én operasjon. KRITISK: Kan kun brukes når brukeren har sendt fil(er) sammen med meldingen.",
+    description: "Last opp vedlagte fil(er) til et kjøp. Brukes etter createPurchase for å legge ved dokumentasjon. KRITISK: Kan kun brukes når brukeren har sendt fil(er) sammen med meldingen. Ved flere filer: bruk fileIndex for å laste opp spesifikk fil til riktig kjøp.",
     parameters: z.object({
       purchaseId: z.number().describe("Kjøps-ID fra createPurchase"),
+      fileIndex: z.number().optional().describe("Hvilken fil som skal lastes opp (1-basert, matcher 'Fil 1', 'Fil 2' osv.). Hvis ikke angitt, lastes ALLE filer opp."),
     }),
-    execute: async ({ purchaseId }) => {
+    execute: async ({ purchaseId, fileIndex }) => {
       try {
         if (!pendingFiles || pendingFiles.length === 0) {
           return {
@@ -2685,10 +2686,45 @@ Verktøyet returnerer:
           };
         }
         
+        // If fileIndex is specified, upload only that specific file
+        if (fileIndex !== undefined) {
+          const arrayIndex = fileIndex - 1; // Convert from 1-based to 0-based
+          if (arrayIndex < 0 || arrayIndex >= pendingFiles.length) {
+            return {
+              success: false,
+              error: `Ugyldig fileIndex: ${fileIndex}. Må være mellom 1 og ${pendingFiles.length}.`,
+            };
+          }
+          
+          const file = pendingFiles[arrayIndex];
+          try {
+            const formData = createAttachmentFormData(file, { attachToSale: true });
+            const attachment = await client.addAttachmentToPurchase(purchaseId, formData);
+            return {
+              success: true,
+              fileUploaded: true,
+              filesUploaded: 1,
+              totalFiles: pendingFiles.length,
+              fileIndex: fileIndex,
+              message: `Fil ${fileIndex} (${file.name}) lastet opp til kjøp ${purchaseId}`,
+              uploadedFiles: [{
+                name: file.name,
+                identifier: attachment.identifier,
+                downloadUrl: attachment.downloadUrl,
+              }],
+            };
+          } catch (error) {
+            return {
+              success: false,
+              error: `Kunne ikke laste opp fil ${fileIndex} (${file.name}): ${error instanceof Error ? error.message : "Ukjent feil"}`,
+            };
+          }
+        }
+        
+        // No fileIndex specified - upload all files (existing behavior)
         const uploadedFiles: Array<{ name: string; identifier?: string; downloadUrl?: string }> = [];
         const errors: string[] = [];
         
-        // Upload all files
         for (const file of pendingFiles) {
           try {
             const formData = createAttachmentFormData(file, { attachToSale: true });
@@ -2731,11 +2767,12 @@ Verktøyet returnerer:
   });
 
   const uploadAttachmentToSale = tool({
-    description: "Last opp ALLE vedlagte filer til et salg. Brukes etter createSale for å legge ved dokumentasjon. Laster opp alle filer automatisk i én operasjon. KRITISK: Kan kun brukes når brukeren har sendt fil(er) sammen med meldingen.",
+    description: "Last opp vedlagte fil(er) til et salg. Brukes etter createSale for å legge ved dokumentasjon. KRITISK: Kan kun brukes når brukeren har sendt fil(er) sammen med meldingen. Ved flere filer: bruk fileIndex for å laste opp spesifikk fil til riktig salg.",
     parameters: z.object({
       saleId: z.number().describe("Salgs-ID fra createSale"),
+      fileIndex: z.number().optional().describe("Hvilken fil som skal lastes opp (1-basert, matcher 'Fil 1', 'Fil 2' osv.). Hvis ikke angitt, lastes ALLE filer opp."),
     }),
-    execute: async ({ saleId }) => {
+    execute: async ({ saleId, fileIndex }) => {
       try {
         if (!pendingFiles || pendingFiles.length === 0) {
           return {
@@ -2744,6 +2781,42 @@ Verktøyet returnerer:
           };
         }
         
+        // If fileIndex is specified, upload only that specific file
+        if (fileIndex !== undefined) {
+          const arrayIndex = fileIndex - 1; // Convert from 1-based to 0-based
+          if (arrayIndex < 0 || arrayIndex >= pendingFiles.length) {
+            return {
+              success: false,
+              error: `Ugyldig fileIndex: ${fileIndex}. Må være mellom 1 og ${pendingFiles.length}.`,
+            };
+          }
+          
+          const file = pendingFiles[arrayIndex];
+          try {
+            const formData = createAttachmentFormData(file);
+            const attachment = await client.addAttachmentToSale(saleId, formData);
+            return {
+              success: true,
+              fileUploaded: true,
+              filesUploaded: 1,
+              totalFiles: pendingFiles.length,
+              fileIndex: fileIndex,
+              message: `Fil ${fileIndex} (${file.name}) lastet opp til salg ${saleId}`,
+              uploadedFiles: [{
+                name: file.name,
+                identifier: attachment.identifier,
+                downloadUrl: attachment.downloadUrl,
+              }],
+            };
+          } catch (error) {
+            return {
+              success: false,
+              error: `Kunne ikke laste opp fil ${fileIndex} (${file.name}): ${error instanceof Error ? error.message : "Ukjent feil"}`,
+            };
+          }
+        }
+        
+        // No fileIndex specified - upload all files (existing behavior)
         const uploadedFiles: Array<{ name: string; identifier?: string; downloadUrl?: string }> = [];
         const errors: string[] = [];
         
@@ -2789,11 +2862,12 @@ Verktøyet returnerer:
   });
 
   const uploadAttachmentToInvoice = tool({
-    description: "Last opp ALLE vedlagte filer til en faktura. Laster opp alle filer automatisk i én operasjon. KRITISK: Kan kun brukes når brukeren har sendt fil(er) sammen med meldingen.",
+    description: "Last opp vedlagte fil(er) til en faktura. KRITISK: Kan kun brukes når brukeren har sendt fil(er) sammen med meldingen. Ved flere filer: bruk fileIndex for å laste opp spesifikk fil til riktig faktura.",
     parameters: z.object({
       invoiceId: z.number().describe("Faktura-ID"),
+      fileIndex: z.number().optional().describe("Hvilken fil som skal lastes opp (1-basert, matcher 'Fil 1', 'Fil 2' osv.). Hvis ikke angitt, lastes ALLE filer opp."),
     }),
-    execute: async ({ invoiceId }) => {
+    execute: async ({ invoiceId, fileIndex }) => {
       try {
         if (!pendingFiles || pendingFiles.length === 0) {
           return {
@@ -2802,6 +2876,42 @@ Verktøyet returnerer:
           };
         }
         
+        // If fileIndex is specified, upload only that specific file
+        if (fileIndex !== undefined) {
+          const arrayIndex = fileIndex - 1; // Convert from 1-based to 0-based
+          if (arrayIndex < 0 || arrayIndex >= pendingFiles.length) {
+            return {
+              success: false,
+              error: `Ugyldig fileIndex: ${fileIndex}. Må være mellom 1 og ${pendingFiles.length}.`,
+            };
+          }
+          
+          const file = pendingFiles[arrayIndex];
+          try {
+            const formData = createAttachmentFormData(file);
+            const attachment = await client.addAttachmentToInvoice(invoiceId, formData);
+            return {
+              success: true,
+              fileUploaded: true,
+              filesUploaded: 1,
+              totalFiles: pendingFiles.length,
+              fileIndex: fileIndex,
+              message: `Fil ${fileIndex} (${file.name}) lastet opp til faktura ${invoiceId}`,
+              uploadedFiles: [{
+                name: file.name,
+                identifier: attachment.identifier,
+                downloadUrl: attachment.downloadUrl,
+              }],
+            };
+          } catch (error) {
+            return {
+              success: false,
+              error: `Kunne ikke laste opp fil ${fileIndex} (${file.name}): ${error instanceof Error ? error.message : "Ukjent feil"}`,
+            };
+          }
+        }
+        
+        // No fileIndex specified - upload all files (existing behavior)
         const uploadedFiles: Array<{ name: string; identifier?: string; downloadUrl?: string }> = [];
         const errors: string[] = [];
         
@@ -2847,11 +2957,12 @@ Verktøyet returnerer:
   });
 
   const uploadAttachmentToJournalEntry = tool({
-    description: "Last opp ALLE vedlagte filer til et bilag/postering. Laster opp alle filer automatisk i én operasjon. KRITISK: Kan kun brukes når brukeren har sendt fil(er) sammen med meldingen.",
+    description: "Last opp vedlagte fil(er) til et bilag/postering. KRITISK: Kan kun brukes når brukeren har sendt fil(er) sammen med meldingen. Ved flere filer: bruk fileIndex for å laste opp spesifikk fil til riktig bilag.",
     parameters: z.object({
       journalEntryId: z.number().describe("Bilag-ID"),
+      fileIndex: z.number().optional().describe("Hvilken fil som skal lastes opp (1-basert, matcher 'Fil 1', 'Fil 2' osv.). Hvis ikke angitt, lastes ALLE filer opp."),
     }),
-    execute: async ({ journalEntryId }) => {
+    execute: async ({ journalEntryId, fileIndex }) => {
       try {
         if (!pendingFiles || pendingFiles.length === 0) {
           return {
@@ -2860,6 +2971,42 @@ Verktøyet returnerer:
           };
         }
         
+        // If fileIndex is specified, upload only that specific file
+        if (fileIndex !== undefined) {
+          const arrayIndex = fileIndex - 1; // Convert from 1-based to 0-based
+          if (arrayIndex < 0 || arrayIndex >= pendingFiles.length) {
+            return {
+              success: false,
+              error: `Ugyldig fileIndex: ${fileIndex}. Må være mellom 1 og ${pendingFiles.length}.`,
+            };
+          }
+          
+          const file = pendingFiles[arrayIndex];
+          try {
+            const formData = createAttachmentFormData(file);
+            const attachment = await client.addAttachmentToJournalEntry(journalEntryId, formData);
+            return {
+              success: true,
+              fileUploaded: true,
+              filesUploaded: 1,
+              totalFiles: pendingFiles.length,
+              fileIndex: fileIndex,
+              message: `Fil ${fileIndex} (${file.name}) lastet opp til bilag ${journalEntryId}`,
+              uploadedFiles: [{
+                name: file.name,
+                identifier: attachment.identifier,
+                downloadUrl: attachment.downloadUrl,
+              }],
+            };
+          } catch (error) {
+            return {
+              success: false,
+              error: `Kunne ikke laste opp fil ${fileIndex} (${file.name}): ${error instanceof Error ? error.message : "Ukjent feil"}`,
+            };
+          }
+        }
+        
+        // No fileIndex specified - upload all files (existing behavior)
         const uploadedFiles: Array<{ name: string; identifier?: string; downloadUrl?: string }> = [];
         const errors: string[] = [];
         

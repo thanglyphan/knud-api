@@ -225,7 +225,7 @@ IKKE spør brukeren om å sende fil${files.length > 1 ? 'ene' : 'en'} på nytt -
           > = [
             { 
               type: "text", 
-              text: `${textContent}\n\n📎 **Vedlagte filer (${files.length} stk):** ${fileNames}\n[ANALYSER bildet/bildene og les av informasjon. Identifiser: leverandør, dato, beløp, MVA, beskrivelse. VIKTIG: Sjekk om det er BETALT (kvittering/kortbetaling) eller UBETALT (forfallsdato/faktura). Spør ALLTID "Stemmer dette?" før registrering. ⛔ IKKE spør om inkl/ekskl MVA hvis du ser MVA-info! 📌 ALLTID spør hvilken bankkonto betalingen gikk fra!]` 
+              text: `${textContent}\n\n📎 **Vedlagte filer (${files.length} stk):** ${fileNames}\n[ANALYSER ALLE vedlagte bilder/filer. Hvis FLERE kvitteringer/fakturaer: 1) Les av info fra HVER fil separat 2) Presenter ALLE i nummerert oversikt (Fil 1, Fil 2, osv.) 3) Sjekk om noen filer ser ut til å være SAMME kvittering - spør brukeren! 4) Spør om alle skal registreres som separate kjøp 5) La brukeren velge om alle skal ha samme konto. For HVER fil: Identifiser leverandør, dato, beløp, MVA, beskrivelse, betalingsstatus. ⛔ IKKE spør om inkl/ekskl MVA hvis du ser MVA-info! 📌 ALLTID spør hvilken bankkonto for betalte kjøp!]` 
             }
           ];
           
