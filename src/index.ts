@@ -3,7 +3,7 @@ import cors from "cors";
 import { openai } from "@ai-sdk/openai";
 import { streamText } from "ai";
 import dotenv from "dotenv";
-import { ACCOUNTING_SYSTEM_PROMPT, FIKEN_SYSTEM_PROMPT, TRIPLETEX_SYSTEM_PROMPT } from "./prompts.js";
+import { ACCOUNTING_SYSTEM_PROMPT, FIKEN_SYSTEM_PROMPT } from "./prompts.js";
 import { prisma } from "./db.js";
 import chatRoutes from "./routes/chat.js";
 import authRoutes from "./routes/auth.js";
@@ -11,8 +11,8 @@ import stripeRoutes, { handleWebhook } from "./routes/stripe.js";
 import { requireAuth, requireAccountingConnection } from "./middleware/auth.js";
 import { createFikenClient } from "./fiken/client.js";
 import { createFikenTools } from "./fiken/tools/index.js";
-import { createTripletexClient } from "./tripletex/client.js";
-import { createTripletexCapabilities } from "./tripletex/capabilities/index.js";
+import { convertPdfToImages } from "./utils/pdfToImage.js";
+
 import type { ChatRequest } from "./types.js";
 
 dotenv.config();
@@ -76,11 +76,10 @@ app.get("/api/financial-summary", requireAuth, requireAccountingConnection, asyn
       const summary = await fikenClient.getFinancialSummary(fromDate, toDate);
       res.json(summary);
     } else if (provider === "tripletex") {
-      // Tripletex doesn't have a direct financial summary endpoint
-      // TODO: Implement aggregated summary from Tripletex data
-      res.json({
-        message: "Finansoversikt er ikke tilgjengelig for Tripletex ennå",
-        provider: "tripletex",
+      // Tripletex kommer snart - ikke tilgjengelig ennå
+      res.status(501).json({
+        error: "Tripletex-integrasjon er ikke tilgjengelig ennå",
+        message: "Kommer snart!",
       });
     } else {
       res.status(400).json({ error: "Ukjent regnskapssystem" });
@@ -97,9 +96,9 @@ app.get("/api/financial-summary", requireAuth, requireAccountingConnection, asyn
 // Supports both Fiken and Tripletex based on user's activeProvider
 app.post("/api/chat", requireAuth, requireAccountingConnection, async (req, res) => {
   try {
-    const { messages, chatId, file } = req.body as ChatRequest & { 
+    const { messages, chatId, files } = req.body as ChatRequest & { 
       chatId?: string;
-      file?: { name: string; type: string; data: string };
+      files?: Array<{ name: string; type: string; data: string }>;
     };
 
     if (!messages || !Array.isArray(messages)) {
@@ -110,8 +109,8 @@ app.post("/api/chat", requireAuth, requireAccountingConnection, async (req, res)
     const provider = req.accountingProvider;
 
     // Log file info for debugging
-    if (file) {
-      console.log("File attached:", { name: file.name, type: file.type, dataLength: file.data?.length });
+    if (files && files.length > 0) {
+      console.log(`${files.length} file(s) attached:`, files.map(f => ({ name: f.name, type: f.type, dataLength: f.data?.length })));
     }
 
     // Get current date in Norwegian format
@@ -131,18 +130,15 @@ app.post("/api/chat", requireAuth, requireAccountingConnection, async (req, res)
     if (provider === "fiken") {
       // Create Fiken client and tools
       const fikenClient = createFikenClient(req.accountingAccessToken!, req.companyId!);
-      tools = createFikenTools(fikenClient, req.companyId!, file);
+      tools = createFikenTools(fikenClient, req.companyId!, files);
       baseSystemPrompt = FIKEN_SYSTEM_PROMPT;
     } else if (provider === "tripletex") {
-      // Create Tripletex client and capabilities
-      const tripletexClient = createTripletexClient(req.accountingAccessToken!, req.companyId!);
-      
-      // Create Tripletex capabilities (capability-based architecture: 2 tools instead of 29)
-      tools = createTripletexCapabilities(tripletexClient);
-      
-      console.log(`[Tripletex] Loaded ${Object.keys(tools).length} capabilities: ${Object.keys(tools).join(", ")}`);
-      
-      baseSystemPrompt = TRIPLETEX_SYSTEM_PROMPT;
+      // Tripletex kommer snart - ikke tilgjengelig ennå
+      res.status(501).json({
+        error: "Tripletex-integrasjon er ikke tilgjengelig ennå",
+        message: "Kommer snart!",
+      });
+      return;
     } else {
       res.status(400).json({ error: "Ukjent regnskapssystem" });
       return;
@@ -155,34 +151,22 @@ app.post("/api/chat", requireAuth, requireAccountingConnection, async (req, res)
 I dag er ${dateStr} (${isoDate}).
 Bruk denne datoen som referanse for alle datoer (f.eks. "i dag", "denne måneden", "i år").`;
 
-    // If there's a file attached, tell the AI about it
-    if (file) {
+    // If there are files attached, tell the AI about them
+    if (files && files.length > 0) {
       if (provider === "fiken") {
+        const fileList = files.map((f, i) => `${i + 1}. ${f.name} (${f.type})`).join('\n');
         systemPromptWithDate += `
 
-## VEDLAGT FIL - HANDLING PÅKREVD!
-Brukeren har vedlagt en fil til DENNE meldingen:
-- Filnavn: ${file.name}
-- Filtype: ${file.type}
+## VEDLAGTE FILER (${files.length} stk) - HANDLING PÅKREVD!
+Brukeren har vedlagt følgende fil${files.length > 1 ? 'er' : ''} til DENNE meldingen:
+${fileList}
 
-**DU MÅ LASTE OPP DENNE FILEN!** Følg disse stegene:
+**DU MÅ LASTE OPP ${files.length > 1 ? 'ALLE FILENE' : 'FILEN'}!** Følg disse stegene:
 1. Først: Opprett kjøpet/salget/bilaget med riktig verktøy (createPurchase, createSale, etc.)
-2. Deretter: Last opp filen med uploadAttachmentToPurchase(purchaseId), uploadAttachmentToSale(saleId), etc.
+2. Deretter: Last opp ${files.length > 1 ? 'alle filene' : 'filen'} med uploadAttachmentToPurchase(purchaseId), uploadAttachmentToSale(saleId), etc.
+   - Verktøyet laster opp ALLE vedlagte filer automatisk i én operasjon.
 
-IKKE spør brukeren om å sende filen på nytt - filen ER allerede vedlagt og klar til opplasting!`;
-      } else if (provider === "tripletex") {
-        systemPromptWithDate += `
-
-## VEDLAGT FIL - HANDLING PÅKREVD!
-Brukeren har vedlagt en fil til DENNE meldingen:
-- Filnavn: ${file.name}
-- Filtype: ${file.type}
-
-**DU MÅ LASTE OPP DENNE FILEN!** Følg disse stegene:
-1. Først: Opprett leverandørfakturaen/ordren/bilaget med riktig verktøy
-2. Deretter: Last opp dokumentet med uploadDocument-verktøyet
-
-IKKE spør brukeren om å sende filen på nytt - filen ER allerede vedlagt og klar til opplasting!`;
+IKKE spør brukeren om å sende fil${files.length > 1 ? 'ene' : 'en'} på nytt - ${files.length > 1 ? 'filene ER' : 'filen ER'} allerede vedlagt og klar${files.length > 1 ? 'e' : ''} til opplasting!`;
       }
     }
 
@@ -191,13 +175,90 @@ IKKE spør brukeren om å sende filen på nytt - filen ER allerede vedlagt og kl
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
 
+    // Process messages - add file info and images to user message if files are attached
+    type MessageContent = 
+      | string 
+      | Array<{ type: "text"; text: string } | { type: "image"; image: string }>;
+    
+    let processedMessages: Array<{
+      role: "user" | "assistant";
+      content: MessageContent;
+    }> = messages.map((msg) => ({
+      role: msg.role as "user" | "assistant",
+      content: msg.content,
+    }));
+
+    // If files are attached, convert to vision format for AI to "see" the content
+    if (files && files.length > 0) {
+      const lastIndex = processedMessages.length - 1;
+      if (lastIndex >= 0 && processedMessages[lastIndex].role === "user") {
+        
+        const imageDataUrls: string[] = [];
+        
+        // Process each file - convert PDFs to images, keep images as-is
+        for (const file of files) {
+          if (file.type.startsWith("image/") && file.data) {
+            // Images can be used directly
+            imageDataUrls.push(file.data);
+            console.log(`[Vision] Added image: ${file.name}`);
+          } else if (file.type === "application/pdf" && file.data) {
+            // Convert PDF to images (max 2 pages)
+            try {
+              const pdfImages = await convertPdfToImages(file.data);
+              imageDataUrls.push(...pdfImages);
+              console.log(`[Vision] Converted PDF ${file.name} to ${pdfImages.length} image(s)`);
+            } catch (err) {
+              console.error(`[Vision] Failed to convert PDF ${file.name}:`, err);
+              // Continue without this file's images
+            }
+          }
+        }
+        
+        const fileNames = files.map(f => f.name).join(", ");
+        const textContent = processedMessages[lastIndex].content as string;
+        
+        if (imageDataUrls.length > 0) {
+          // Convert to multi-modal format for vision
+          const contentParts: Array<
+            | { type: "text"; text: string }
+            | { type: "image"; image: string }
+          > = [
+            { 
+              type: "text", 
+              text: `${textContent}\n\n📎 **Vedlagte filer (${files.length} stk):** ${fileNames}\n[ANALYSER bildet/bildene og les av informasjon fra kvitteringen. Spør ALLTID "Stemmer dette?" før registrering.]` 
+            }
+          ];
+          
+          // Add images (max 4 to avoid token limits)
+          const maxImages = Math.min(imageDataUrls.length, 4);
+          for (let i = 0; i < maxImages; i++) {
+            contentParts.push({
+              type: "image",
+              image: imageDataUrls[i]
+            });
+          }
+          
+          processedMessages[lastIndex] = {
+            role: "user",
+            content: contentParts
+          };
+          
+          console.log(`[Vision] Added ${maxImages} image(s) to message for AI analysis`);
+        } else {
+          // No images could be extracted, just add file info as text
+          processedMessages[lastIndex] = {
+            ...processedMessages[lastIndex],
+            content: `${textContent}\n\n📎 **Vedlagte filer (${files.length} stk):** ${fileNames}\n[Filene er klare til opplasting etter at kjøp/salg er opprettet]`
+          };
+          console.log("[AI] Added file info to user message (no images for vision):", fileNames);
+        }
+      }
+    }
+
     const result = streamText({
       model: openai("gpt-4.1-mini"),
       system: systemPromptWithDate,
-      messages: messages.map((msg) => ({
-        role: msg.role as "user" | "assistant",
-        content: msg.content,
-      })),
+      messages: processedMessages as Parameters<typeof streamText>[0]["messages"],
       tools,
       maxSteps: 10,
       toolChoice: "auto", // Ensure tool calling is enabled
@@ -467,7 +528,7 @@ app.listen(PORT, () => {
   console.log(`Health check: http://localhost:${PORT}/health`);
   console.log(`Auth endpoints: http://localhost:${PORT}/api/auth/*`);
   console.log(`Stripe endpoints: http://localhost:${PORT}/api/stripe/*`);
-  console.log(`Chat endpoint (with Fiken/Tripletex): POST http://localhost:${PORT}/api/chat`);
+  console.log(`Chat endpoint (with Fiken): POST http://localhost:${PORT}/api/chat`);
   console.log(`Chat endpoint (simple): POST http://localhost:${PORT}/api/chat/simple`);
   console.log(`Chats CRUD: http://localhost:${PORT}/api/chats`);
 });

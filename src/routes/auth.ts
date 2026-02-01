@@ -16,17 +16,8 @@ import {
   isFikenConfigured,
   deleteFikenConnection,
 } from "../fiken/auth.js";
-import {
-  createSessionToken,
-  saveTripletexTokens,
-  isTripletexConfigured,
-  getValidSessionToken,
-} from "../tripletex/auth.js";
 
 const router = Router();
-
-const TRIPLETEX_API_URL =
-  process.env.TRIPLETEX_API_URL || "https://api.tripletex.io/v2";
 
 // Store state tokens temporarily (in production, use Redis or similar)
 const stateTokens = new Map<string, { createdAt: number }>();
@@ -60,14 +51,14 @@ router.get("/providers", (_req, res) => {
     });
   }
 
-  if (isTripletexConfigured()) {
-    providers.push({
-      id: "tripletex",
-      name: "Tripletex",
-      description: "Komplett regnskapssystem for norske bedrifter",
-      authType: "token",
-    });
-  }
+  // Tripletex kommer snart
+  providers.push({
+    id: "tripletex",
+    name: "Tripletex",
+    description: "Kommer snart",
+    authType: "token",
+    disabled: true,
+  });
 
   res.json({ providers });
 });
@@ -164,64 +155,13 @@ router.post("/fiken/callback", async (req, res) => {
 
 /**
  * POST /api/auth/tripletex/connect
- * Connect Tripletex using employee token
+ * Tripletex kommer snart - ikke tilgjengelig ennå
  */
-router.post("/tripletex/connect", async (req, res) => {
-  try {
-    if (!isTripletexConfigured()) {
-      res.status(500).json({ error: "Tripletex is not configured" });
-      return;
-    }
-
-    const { employeeToken, expirationDate, email } = req.body;
-
-    if (!employeeToken) {
-      res.status(400).json({ error: "Employee token is required" });
-      return;
-    }
-
-    if (!email) {
-      res.status(400).json({ error: "Email is required" });
-      return;
-    }
-
-    // Create session token
-    const { sessionToken, expiresAt } = await createSessionToken(
-      employeeToken,
-      expirationDate
-    );
-
-    // Create or update user in database
-    const user = await prisma.user.upsert({
-      where: { email },
-      create: {
-        email,
-        activeProvider: "tripletex",
-      },
-      update: {
-        activeProvider: "tripletex",
-      },
-    });
-
-    // Save Tripletex tokens
-    await saveTripletexTokens(user.id, sessionToken, employeeToken, expiresAt);
-
-    res.json({
-      success: true,
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-      },
-      sessionToken: user.id,
-    });
-  } catch (error) {
-    console.error("Tripletex connect error:", error);
-    res.status(500).json({
-      error: "Failed to connect Tripletex",
-      details: error instanceof Error ? error.message : "Unknown error",
-    });
-  }
+router.post("/tripletex/connect", async (_req, res) => {
+  res.status(501).json({
+    error: "Tripletex-integrasjon er ikke tilgjengelig ennå",
+    message: "Kommer snart!",
+  });
 });
 
 // ==================== USER INFO ====================
@@ -423,107 +363,10 @@ router.get("/companies", async (req, res) => {
         })),
       });
     } else if (provider === "tripletex") {
-      const sessionToken = await getValidSessionToken(userId);
-      if (!sessionToken) {
-        res.status(401).json({ error: "Tripletex token expired or invalid" });
-        return;
-      }
-
-      // Bruk companyId=0 for å hente selskaper brukeren har tilgang til
-      // companyId=0 betyr "selskapet til token-eieren"
-      const authHeader = `Basic ${Buffer.from(`0:${sessionToken}`).toString("base64")}`;
-
-      // Først, hent brukerens eget selskap via whoAmI
-      const whoAmIResponse = await fetch(
-        `${TRIPLETEX_API_URL}/token/session/%3EwhoAmI`,
-        {
-          headers: {
-            Authorization: authHeader,
-          },
-        }
-      );
-
-      if (!whoAmIResponse.ok) {
-        const errorText = await whoAmIResponse.text();
-        console.error("Tripletex whoAmI error:", errorText);
-        throw new Error("Failed to get user info from Tripletex");
-      }
-
-      const whoAmIData = await whoAmIResponse.json();
-      console.log("Tripletex whoAmI response:", JSON.stringify(whoAmIData, null, 2));
-
-      // Hent brukerens selskap-ID fra whoAmI
-      const userCompanyId = whoAmIData.value?.company?.id;
-      const companies: any[] = [];
-
-      // Hvis vi har en company ID, hent full selskapsinformasjon
-      if (userCompanyId) {
-        // Bruk companyId i auth header for å hente selskapsdetaljer
-        const companyAuthHeader = `Basic ${Buffer.from(`${userCompanyId}:${sessionToken}`).toString("base64")}`;
-        
-        const companyResponse = await fetch(
-          `${TRIPLETEX_API_URL}/company/${userCompanyId}`,
-          {
-            headers: {
-              Authorization: companyAuthHeader,
-            },
-          }
-        );
-
-        if (companyResponse.ok) {
-          const companyData = await companyResponse.json();
-          console.log("Tripletex company response:", JSON.stringify(companyData, null, 2));
-          
-          const company = companyData.value;
-          if (company) {
-            companies.push({
-              id: String(company.id),
-              name: company.name || `Selskap ${company.id}`,
-              organizationNumber: company.organizationNumber,
-            });
-          }
-        } else {
-          // Fallback: bruk data fra whoAmI selv om det mangler navn
-          const simpleCompany = whoAmIData.value?.company;
-          if (simpleCompany) {
-            companies.push({
-              id: String(simpleCompany.id),
-              name: simpleCompany.name || `Selskap ${simpleCompany.id}`,
-              organizationNumber: simpleCompany.organizationNumber,
-            });
-          }
-        }
-      }
-
-      // Hent også liste over selskaper med tilgang (for regnskapsførere)
-      const companiesResponse = await fetch(
-        `${TRIPLETEX_API_URL}/company/%3EwithLoginAccess`,
-        {
-          headers: {
-            Authorization: authHeader,
-          },
-        }
-      );
-
-      if (companiesResponse.ok) {
-        const companiesData = await companiesResponse.json();
-        console.log("Tripletex companies response:", JSON.stringify(companiesData, null, 2));
-        
-        // Legg til eventuelle andre selskaper (unngå duplikater)
-        for (const c of companiesData.values || []) {
-          if (!companies.some((existing) => existing.id === String(c.id))) {
-            companies.push({
-              id: String(c.id),
-              name: c.name || `Selskap ${c.id}`,
-              organizationNumber: c.organizationNumber,
-            });
-          }
-        }
-      }
-
-      res.json({
-        provider: "tripletex",
-        companies,
+      // Tripletex kommer snart - ikke tilgjengelig ennå
+      res.status(501).json({
+        error: "Tripletex-integrasjon er ikke tilgjengelig ennå",
+        message: "Kommer snart!",
       });
     } else {
       res.status(400).json({ error: "Invalid provider" });

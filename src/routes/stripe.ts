@@ -127,7 +127,7 @@ router.post("/init-checkout", async (req: Request, res: Response) => {
     if (!customerId) {
       const customer = await stripe.customers.create({
         email: user.email,
-        name: activeConnection?.companyName || user.name || undefined,
+        name: user.name || undefined,
         metadata: {
           userId: user.id,
         },
@@ -287,16 +287,22 @@ router.post("/complete-subscription", async (req: Request, res: Response) => {
     // Treat "trialing" as "active" for our purposes
     const status = subscription.status === "trialing" ? "active" : subscription.status;
     
-    // Get subscription dates - cast to access properties
-    const sub = subscription as unknown as {
-      created: number;
-      trial_end: number | null;
-      current_period_end: number;
-    };
-    const subscriptionStarted = new Date(sub.created * 1000);
-    const subscriptionEnds = sub.trial_end 
-      ? new Date(sub.trial_end * 1000)
-      : new Date(sub.current_period_end * 1000);
+    // Get subscription dates safely
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const subAny = subscription as any;
+    const createdTimestamp = subAny.created || subAny.start_date || Math.floor(Date.now() / 1000);
+    const subscriptionStarted = new Date(createdTimestamp * 1000);
+    
+    // Use trial_end if available, otherwise current_period_end
+    let subscriptionEnds: Date;
+    if (subAny.trial_end && typeof subAny.trial_end === 'number') {
+      subscriptionEnds = new Date(subAny.trial_end * 1000);
+    } else if (subAny.current_period_end && typeof subAny.current_period_end === 'number') {
+      subscriptionEnds = new Date(subAny.current_period_end * 1000);
+    } else {
+      // Fallback: 30 days from now
+      subscriptionEnds = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    }
 
     await prisma.user.update({
       where: { id: userId },
@@ -310,7 +316,7 @@ router.post("/complete-subscription", async (req: Request, res: Response) => {
     res.json({
       subscriptionId: subscription.id,
       status: subscription.status,
-      trialEnd: sub.trial_end ? new Date(sub.trial_end * 1000).toISOString() : null,
+      trialEnd: subAny.trial_end ? new Date(subAny.trial_end * 1000).toISOString() : null,
     });
   } catch (error) {
     console.error("Error completing subscription:", error);

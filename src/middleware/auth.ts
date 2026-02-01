@@ -6,7 +6,6 @@
 import { Request, Response, NextFunction } from "express";
 import { prisma } from "../db.js";
 import { getValidAccessToken as getFikenAccessToken } from "../fiken/auth.js";
-import { getValidSessionToken as getTripletexSessionToken } from "../tripletex/auth.js";
 
 // Extend Express Request type
 declare global {
@@ -120,7 +119,12 @@ export async function requireAccountingConnection(
     if (provider === "fiken") {
       accessToken = await getFikenAccessToken(req.userId);
     } else if (provider === "tripletex") {
-      accessToken = await getTripletexSessionToken(req.userId);
+      // Tripletex kommer snart - ikke tilgjengelig ennå
+      res.status(501).json({
+        error: "Tripletex-integrasjon er ikke tilgjengelig ennå",
+        message: "Kommer snart!",
+      });
+      return;
     }
 
     if (!accessToken) {

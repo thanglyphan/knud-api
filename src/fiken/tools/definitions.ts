@@ -48,7 +48,7 @@ function createAttachmentFormData(file: PendingFile, options?: { attachToPayment
 }
 
 // Factory function to create tools with a specific Fiken client
-export function createFikenTools(client: FikenClient, companySlug: string, pendingFile?: PendingFile) {
+export function createFikenTools(client: FikenClient, companySlug: string, pendingFiles?: PendingFile[]) {
   
   // Initialiser account helper med caching
   const accountHelper = createAccountHelper(client, companySlug);
@@ -809,7 +809,7 @@ export function createFikenTools(client: FikenClient, companySlug: string, pendi
   });
 
   const createPurchase = tool({
-    description: "Registrer et nytt kjøp/leverandørfaktura i Fiken. KRITISK: Kall ALLTID searchAccountByDescription FØRST for å finne riktig kostnadskonto! PÅKREVD: date, kind, paid, lines, currency. For kontantkjøp: kind='cash_purchase', paid=true, paymentAccount. For leverandørfaktura: kind='supplier', paid=false, dueDate.",
+    description: "Registrer et nytt kjøp/leverandørfaktura i Fiken. KRITISK: Kall ALLTID suggestAccounts FØRST, vis 3 forslag til brukeren, og VENT på brukerens valg før du registrerer! PÅKREVD: date, kind, paid, lines, currency. For kontantkjøp: kind='cash_purchase', paid=true, paymentAccount. For leverandørfaktura: kind='supplier', paid=false, dueDate.",
     parameters: z.object({
       date: z.string().describe("Kjøpsdato (YYYY-MM-DD)"),
       kind: z.enum(["cash_purchase", "supplier"]).describe("Type: 'cash_purchase' (kontantkjøp) eller 'supplier' (leverandørfaktura)"),
@@ -1091,7 +1091,7 @@ export function createFikenTools(client: FikenClient, companySlug: string, pendi
   });
 
   const createSale = tool({
-    description: "Opprett et nytt salg (annet salg, ikke faktura). KRITISK: Kall ALLTID searchAccountByDescription FØRST for å finne riktig inntektskonto! Bruk dette for kontantsalg uten faktura. PÅKREVD: date, kind, paid, lines, currency.",
+    description: "Opprett et nytt salg (annet salg, ikke faktura). KRITISK: Kall ALLTID suggestAccounts FØRST, vis 3 forslag til brukeren, og VENT på brukerens valg før du registrerer! Bruk dette for kontantsalg uten faktura. PÅKREVD: date, kind, paid, lines, currency.",
     parameters: z.object({
       date: z.string().describe("Salgsdato (YYYY-MM-DD)"),
       kind: z.enum(["cash_sale", "external_invoice"]).default("cash_sale").describe("Type salg"),
@@ -1958,7 +1958,7 @@ export function createFikenTools(client: FikenClient, companySlug: string, pendi
   // ============================================
 
   const getAccounts = tool({
-    description: "Hent liste over regnskapskontoer fra kontoplanen. For å finne riktig konto basert på beskrivelse, bruk searchAccountByDescription i stedet. Bruk fromAccount/toAccount for å begrense (f.eks. '6000'/'7999' for driftskostnader).",
+    description: "Hent liste over regnskapskontoer fra kontoplanen. For å finne riktig konto basert på beskrivelse, bruk suggestAccounts i stedet. Bruk fromAccount/toAccount for å begrense (f.eks. '6000'/'7999' for driftskostnader).",
     parameters: z.object({
       fromAccount: z.string().optional().describe("Fra kontonummer"),
       toAccount: z.string().optional().describe("Til kontonummer"),
@@ -2011,76 +2011,101 @@ export function createFikenTools(client: FikenClient, companySlug: string, pendi
   });
 
   // ============================================
-  // SMART ACCOUNT SEARCH TOOL
+  // ACCOUNT SUGGESTION TOOL (AI-basert)
   // ============================================
 
-  const searchAccountByDescription = tool({
-    description: `Søk etter riktig regnskapskonto basert på beskrivelse av utgift/inntekt.
-BRUK ALLTID DETTE VERKTØYET FØR bokføring med createJournalEntry, createPurchase eller createSale!
+  const suggestAccounts = tool({
+    description: `Finn de mest relevante kontoene for en utgift eller inntekt.
+Bruker AI til å analysere beskrivelsen og velge fra selskapets kontoplan.
 
-Eksempler på søk:
-- "kjøpte lunsj til møte" → 7350 Servering/bevertning
-- "betalt husleie" → 6300 Leie lokaler
-- "ny programvare" → 6860 Programvare
-- "middag med kunde" → 7320 Representasjon (⚠️ IKKE MVA-fradrag!)
-- "overtidsmat" → 5915 Overtidsmat (⚠️ IKKE MVA-fradrag!)
-- "flyreise" → 7140 Reisekostnader
+ARBEIDSFLYT:
+1. Kall dette verktøyet med beskrivelse av utgift/inntekt
+2. VIS de 3 forslagene til brukeren (inkludert reason, MVA-info og vatNote)
+3. Hvis vatNote finnes - FØLG instruksjonen (f.eks. spør om innenlands/utenlands)
+4. VENT på brukerens valg (1, 2 eller 3) OG svar på eventuelle oppfølgingsspørsmål
+5. Spør om beløpet er inkl. eller ekskl. MVA - KUN hvis dette IKKE allerede er kjent (fra kvittering, brukerens melding, eller tidligere i samtalen)
+6. Registrer med valgt konto og riktig MVA-behandling
 
-VIKTIG: Sjekk alltid 'vatDeductible' i resultatet!
-- vatDeductible: true → Normal MVA-behandling
-- vatDeductible: false → BRUK vatType: "NONE" og registrer HELE bruttobeløpet!
-
-Returnerer topp 5 matchende kontoer med anbefaling og MVA-info.`,
+Verktøyet returnerer:
+- reason: Kort forklaring
+- vatDeductible: Om kontoen har MVA-fradrag
+- vatNote: VIKTIG veiledning om MVA eller spørsmål som MÅ avklares`,
     parameters: z.object({
-      description: z.string().describe("Beskrivelse av utgiften/inntekten (f.eks. 'mat til møte', 'husleie januar', 'telefon')"),
-      accountType: z.enum(["expense", "income", "all"]).default("expense").describe("Type: expense (kostnad 4000-7999), income (inntekt 3000-3999), all (alle)"),
+      description: z.string().describe("Beskrivelse av utgift/inntekt (f.eks. 'flyreise til Oslo', 'kundemiddag', 'programvare')"),
+      accountType: z.enum(["expense", "income"]).describe("'expense' for kostnader (4000-7999), 'income' for inntekter (3000-3999)"),
     }),
     execute: async ({ description, accountType }) => {
       try {
-        const results = await accountHelper.searchAccountByDescription(description, accountType);
+        const result = await accountHelper.suggestAccounts(description, accountType);
         
-        if (results.length === 0) {
-          // Fallback: Hent vanlige kontoer i relevant område
-          const commonAccounts = await accountHelper.getCommonAccounts(accountType === "income" ? "income" : "expense");
-          
+        if (result.suggestions.length === 0) {
           return {
             success: true,
-            message: `Ingen direkte match for "${description}". Her er vanlige ${accountType === "income" ? "inntekts" : "kostnads"}kontoer:`,
-            noDirectMatch: true,
-            suggestion: "Prøv å beskrive utgiften/inntekten mer spesifikt, eller velg fra listen under.",
-            commonAccounts: commonAccounts.map(a => ({ code: a.code, name: a.name })),
+            suggestions: [],
+            noMatch: true,
+            message: `Fant ingen passende kontoer for "${description}". Be brukeren beskrive utgiften/inntekten på en annen måte.`,
           };
         }
         
-        const recommended = results[0];
+        return {
+          success: true,
+          suggestions: result.suggestions.map((s, index) => ({
+            number: index + 1,
+            code: s.code,
+            name: s.name,
+            reason: s.reason,
+            vatDeductible: s.vatDeductible,
+            vatNote: s.vatNote,
+          })),
+          searchDescription: result.searchDescription,
+          message: "Vis forslagene til brukeren. VIKTIG: Hvis vatNote finnes, FØLG instruksjonen (spør oppfølgingsspørsmål). Spør om inkl/ekskl MVA KUN hvis dette ikke allerede er oppgitt eller kjent.",
+        };
+      } catch (error) {
+        console.error("suggestAccounts error:", error);
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : "Kunne ikke finne kontoer",
+        };
+      }
+    },
+  });
+
+  const getMoreAccountSuggestions = tool({
+    description: "Hent flere kontoforslag når de første 3 ikke passet. Bruker AI til å finne alternative kontoer.",
+    parameters: z.object({
+      description: z.string().describe("Samme beskrivelse som ble brukt i suggestAccounts"),
+      accountType: z.enum(["expense", "income"]).describe("'expense' for kostnader, 'income' for inntekter"),
+      excludeCodes: z.array(z.string()).optional().describe("Kontonumre som allerede er foreslått og skal ekskluderes"),
+    }),
+    execute: async ({ description, accountType, excludeCodes = [] }) => {
+      try {
+        const result = await accountHelper.getMoreSuggestions(description, accountType, excludeCodes);
+        
+        if (result.suggestions.length === 0) {
+          return {
+            success: true,
+            suggestions: [],
+            message: "Fant ingen flere passende kontoer. Be brukeren beskrive utgiften/inntekten på en annen måte.",
+          };
+        }
         
         return {
           success: true,
-          message: `Fant ${results.length} matchende kontoer for "${description}"`,
-          recommended: {
-            code: recommended.code,
-            name: recommended.name,
-            reason: recommended.reason,
-            vatDeductible: recommended.vatDeductible,
-          },
-          vatWarning: recommended.vatDeductible === false 
-            ? `⚠️ VIKTIG: Denne kontoen (${recommended.code}) har IKKE MVA-fradrag! Bruk vatType: "NONE" og registrer HELE bruttobeløpet som netPrice.`
-            : null,
-          alternatives: results.slice(1).map(r => ({
-            code: r.code,
-            name: r.name,
-            reason: r.reason,
-            vatDeductible: r.vatDeductible,
+          suggestions: result.suggestions.map((s, index) => ({
+            number: index + 4, // Starter på 4 siden de første 3 allerede er vist
+            code: s.code,
+            name: s.name,
+            reason: s.reason,
+            vatDeductible: s.vatDeductible,
+            vatNote: s.vatNote,
           })),
-          tip: recommended.vatDeductible === false
-            ? `Bruk '${recommended.code}' som konto med vatType: "NONE" og netPrice = HELE beløpet (ikke trekk fra MVA!)`
-            : "Bruk 'recommended.code' som konto i createJournalEntry, createPurchase eller createSale.",
+          message: "Her er flere alternativer. Vis disse til brukeren og be dem velge. Husk å følge vatNote hvis den finnes.",
         };
       } catch (error) {
-        console.error("searchAccountByDescription error:", error);
+        console.error("getMoreAccountSuggestions error:", error);
         return {
           success: false,
-          error: error instanceof Error ? `${error.message} (${error.stack?.split('\n')[1]?.trim() || 'no stack'})` : "Kunne ikke søke etter kontoer",
+          error: error instanceof Error ? error.message : "Kunne ikke hente flere kontoer",
         };
       }
     },
@@ -2420,7 +2445,7 @@ Returnerer topp 5 matchende kontoer med anbefaling og MVA-info.`,
   });
 
   const createJournalEntry = tool({
-    description: "Opprett et bilag/fri postering i Fiken. KRITISK: Kall ALLTID searchAccountByDescription FØRST for å finne riktig konto! Hver linje MÅ ha debitAccount og/eller creditAccount. Beløp er alltid positivt. Bankkontoer (1920) krever reskontro-format - bruk getBankAccounts først!",
+    description: "Opprett et bilag/fri postering i Fiken. KRITISK: Kall ALLTID suggestAccounts FØRST, vis 3 forslag til brukeren, og VENT på brukerens valg før du registrerer! Hver linje MÅ ha debitAccount og/eller creditAccount. Beløp er alltid positivt. Bankkontoer (1920) krever reskontro-format - bruk getBankAccounts først!",
     parameters: z.object({
       date: z.string().describe("Bilagsdato (YYYY-MM-DD)"),
       description: z.string().describe("Beskrivelse av bilaget (maks 160 tegn)"),
@@ -2637,35 +2662,59 @@ Returnerer topp 5 matchende kontoer med anbefaling og MVA-info.`,
 
   // ============================================
   // ATTACHMENT UPLOAD TOOLS
-  // These tools upload the file attached to the current chat message
+  // These tools upload the files attached to the current chat message
+  // All files are uploaded automatically in one operation
   // ============================================
 
   const uploadAttachmentToPurchase = tool({
-    description: "Last opp vedlagt fil (kvittering/faktura) til et kjøp. Brukes etter createPurchase for å legge ved dokumentasjon. KRITISK: Kan kun brukes når brukeren har sendt en fil sammen med meldingen.",
+    description: "Last opp ALLE vedlagte filer (kvitteringer/fakturaer) til et kjøp. Brukes etter createPurchase for å legge ved dokumentasjon. Laster opp alle filer automatisk i én operasjon. KRITISK: Kan kun brukes når brukeren har sendt fil(er) sammen med meldingen.",
     parameters: z.object({
       purchaseId: z.number().describe("Kjøps-ID fra createPurchase"),
     }),
     execute: async ({ purchaseId }) => {
       try {
-        if (!pendingFile) {
+        if (!pendingFiles || pendingFiles.length === 0) {
           return {
             success: false,
-            error: "Ingen fil vedlagt. Brukeren må sende en fil (bilde/PDF) sammen med meldingen for å bruke dette verktøyet.",
+            error: "Ingen filer vedlagt. Brukeren må sende fil(er) (bilde/PDF) sammen med meldingen for å bruke dette verktøyet.",
           };
         }
         
-        // For purchases, attachToSale=true means it documents the purchase itself (invoice/receipt)
-        const formData = createAttachmentFormData(pendingFile, { attachToSale: true });
-        const attachment = await client.addAttachmentToPurchase(purchaseId, formData);
+        const uploadedFiles: Array<{ name: string; identifier?: string; downloadUrl?: string }> = [];
+        const errors: string[] = [];
+        
+        // Upload all files
+        for (const file of pendingFiles) {
+          try {
+            const formData = createAttachmentFormData(file, { attachToSale: true });
+            const attachment = await client.addAttachmentToPurchase(purchaseId, formData);
+            uploadedFiles.push({
+              name: file.name,
+              identifier: attachment.identifier,
+              downloadUrl: attachment.downloadUrl,
+            });
+          } catch (error) {
+            errors.push(`${file.name}: ${error instanceof Error ? error.message : "Ukjent feil"}`);
+          }
+        }
+        
+        if (uploadedFiles.length === 0) {
+          return {
+            success: false,
+            error: `Kunne ikke laste opp noen filer: ${errors.join("; ")}`,
+          };
+        }
         
         return {
           success: true,
           fileUploaded: true,
-          message: `Vedlegg "${pendingFile.name}" lastet opp til kjøp ${purchaseId}`,
-          attachment: {
-            identifier: attachment.identifier,
-            downloadUrl: attachment.downloadUrl,
-          },
+          filesUploaded: uploadedFiles.length,
+          totalFiles: pendingFiles.length,
+          message: uploadedFiles.length === pendingFiles.length 
+            ? `Alle ${uploadedFiles.length} vedlegg lastet opp til kjøp ${purchaseId}`
+            : `${uploadedFiles.length} av ${pendingFiles.length} vedlegg lastet opp til kjøp ${purchaseId}`,
+          uploadedFiles,
+          errors: errors.length > 0 ? errors : undefined,
         };
       } catch (error) {
         return {
@@ -2677,30 +2726,53 @@ Returnerer topp 5 matchende kontoer med anbefaling og MVA-info.`,
   });
 
   const uploadAttachmentToSale = tool({
-    description: "Last opp vedlagt fil til et salg. Brukes etter createSale for å legge ved dokumentasjon. KRITISK: Kan kun brukes når brukeren har sendt en fil sammen med meldingen.",
+    description: "Last opp ALLE vedlagte filer til et salg. Brukes etter createSale for å legge ved dokumentasjon. Laster opp alle filer automatisk i én operasjon. KRITISK: Kan kun brukes når brukeren har sendt fil(er) sammen med meldingen.",
     parameters: z.object({
       saleId: z.number().describe("Salgs-ID fra createSale"),
     }),
     execute: async ({ saleId }) => {
       try {
-        if (!pendingFile) {
+        if (!pendingFiles || pendingFiles.length === 0) {
           return {
             success: false,
-            error: "Ingen fil vedlagt. Brukeren må sende en fil (bilde/PDF) sammen med meldingen for å bruke dette verktøyet.",
+            error: "Ingen filer vedlagt. Brukeren må sende fil(er) (bilde/PDF) sammen med meldingen for å bruke dette verktøyet.",
           };
         }
         
-        const formData = createAttachmentFormData(pendingFile);
-        const attachment = await client.addAttachmentToSale(saleId, formData);
+        const uploadedFiles: Array<{ name: string; identifier?: string; downloadUrl?: string }> = [];
+        const errors: string[] = [];
+        
+        for (const file of pendingFiles) {
+          try {
+            const formData = createAttachmentFormData(file);
+            const attachment = await client.addAttachmentToSale(saleId, formData);
+            uploadedFiles.push({
+              name: file.name,
+              identifier: attachment.identifier,
+              downloadUrl: attachment.downloadUrl,
+            });
+          } catch (error) {
+            errors.push(`${file.name}: ${error instanceof Error ? error.message : "Ukjent feil"}`);
+          }
+        }
+        
+        if (uploadedFiles.length === 0) {
+          return {
+            success: false,
+            error: `Kunne ikke laste opp noen filer: ${errors.join("; ")}`,
+          };
+        }
         
         return {
           success: true,
           fileUploaded: true,
-          message: `Vedlegg "${pendingFile.name}" lastet opp til salg ${saleId}`,
-          attachment: {
-            identifier: attachment.identifier,
-            downloadUrl: attachment.downloadUrl,
-          },
+          filesUploaded: uploadedFiles.length,
+          totalFiles: pendingFiles.length,
+          message: uploadedFiles.length === pendingFiles.length 
+            ? `Alle ${uploadedFiles.length} vedlegg lastet opp til salg ${saleId}`
+            : `${uploadedFiles.length} av ${pendingFiles.length} vedlegg lastet opp til salg ${saleId}`,
+          uploadedFiles,
+          errors: errors.length > 0 ? errors : undefined,
         };
       } catch (error) {
         return {
@@ -2712,30 +2784,53 @@ Returnerer topp 5 matchende kontoer med anbefaling og MVA-info.`,
   });
 
   const uploadAttachmentToInvoice = tool({
-    description: "Last opp vedlagt fil til en faktura. KRITISK: Kan kun brukes når brukeren har sendt en fil sammen med meldingen.",
+    description: "Last opp ALLE vedlagte filer til en faktura. Laster opp alle filer automatisk i én operasjon. KRITISK: Kan kun brukes når brukeren har sendt fil(er) sammen med meldingen.",
     parameters: z.object({
       invoiceId: z.number().describe("Faktura-ID"),
     }),
     execute: async ({ invoiceId }) => {
       try {
-        if (!pendingFile) {
+        if (!pendingFiles || pendingFiles.length === 0) {
           return {
             success: false,
-            error: "Ingen fil vedlagt. Brukeren må sende en fil (bilde/PDF) sammen med meldingen for å bruke dette verktøyet.",
+            error: "Ingen filer vedlagt. Brukeren må sende fil(er) (bilde/PDF) sammen med meldingen for å bruke dette verktøyet.",
           };
         }
         
-        const formData = createAttachmentFormData(pendingFile);
-        const attachment = await client.addAttachmentToInvoice(invoiceId, formData);
+        const uploadedFiles: Array<{ name: string; identifier?: string; downloadUrl?: string }> = [];
+        const errors: string[] = [];
+        
+        for (const file of pendingFiles) {
+          try {
+            const formData = createAttachmentFormData(file);
+            const attachment = await client.addAttachmentToInvoice(invoiceId, formData);
+            uploadedFiles.push({
+              name: file.name,
+              identifier: attachment.identifier,
+              downloadUrl: attachment.downloadUrl,
+            });
+          } catch (error) {
+            errors.push(`${file.name}: ${error instanceof Error ? error.message : "Ukjent feil"}`);
+          }
+        }
+        
+        if (uploadedFiles.length === 0) {
+          return {
+            success: false,
+            error: `Kunne ikke laste opp noen filer: ${errors.join("; ")}`,
+          };
+        }
         
         return {
           success: true,
           fileUploaded: true,
-          message: `Vedlegg "${pendingFile.name}" lastet opp til faktura ${invoiceId}`,
-          attachment: {
-            identifier: attachment.identifier,
-            downloadUrl: attachment.downloadUrl,
-          },
+          filesUploaded: uploadedFiles.length,
+          totalFiles: pendingFiles.length,
+          message: uploadedFiles.length === pendingFiles.length 
+            ? `Alle ${uploadedFiles.length} vedlegg lastet opp til faktura ${invoiceId}`
+            : `${uploadedFiles.length} av ${pendingFiles.length} vedlegg lastet opp til faktura ${invoiceId}`,
+          uploadedFiles,
+          errors: errors.length > 0 ? errors : undefined,
         };
       } catch (error) {
         return {
@@ -2747,30 +2842,53 @@ Returnerer topp 5 matchende kontoer med anbefaling og MVA-info.`,
   });
 
   const uploadAttachmentToJournalEntry = tool({
-    description: "Last opp vedlagt fil til et bilag/postering. KRITISK: Kan kun brukes når brukeren har sendt en fil sammen med meldingen.",
+    description: "Last opp ALLE vedlagte filer til et bilag/postering. Laster opp alle filer automatisk i én operasjon. KRITISK: Kan kun brukes når brukeren har sendt fil(er) sammen med meldingen.",
     parameters: z.object({
       journalEntryId: z.number().describe("Bilag-ID"),
     }),
     execute: async ({ journalEntryId }) => {
       try {
-        if (!pendingFile) {
+        if (!pendingFiles || pendingFiles.length === 0) {
           return {
             success: false,
-            error: "Ingen fil vedlagt. Brukeren må sende en fil (bilde/PDF) sammen med meldingen for å bruke dette verktøyet.",
+            error: "Ingen filer vedlagt. Brukeren må sende fil(er) (bilde/PDF) sammen med meldingen for å bruke dette verktøyet.",
           };
         }
         
-        const formData = createAttachmentFormData(pendingFile);
-        const attachment = await client.addAttachmentToJournalEntry(journalEntryId, formData);
+        const uploadedFiles: Array<{ name: string; identifier?: string; downloadUrl?: string }> = [];
+        const errors: string[] = [];
+        
+        for (const file of pendingFiles) {
+          try {
+            const formData = createAttachmentFormData(file);
+            const attachment = await client.addAttachmentToJournalEntry(journalEntryId, formData);
+            uploadedFiles.push({
+              name: file.name,
+              identifier: attachment.identifier,
+              downloadUrl: attachment.downloadUrl,
+            });
+          } catch (error) {
+            errors.push(`${file.name}: ${error instanceof Error ? error.message : "Ukjent feil"}`);
+          }
+        }
+        
+        if (uploadedFiles.length === 0) {
+          return {
+            success: false,
+            error: `Kunne ikke laste opp noen filer: ${errors.join("; ")}`,
+          };
+        }
         
         return {
           success: true,
           fileUploaded: true,
-          message: `Vedlegg "${pendingFile.name}" lastet opp til bilag ${journalEntryId}`,
-          attachment: {
-            identifier: attachment.identifier,
-            downloadUrl: attachment.downloadUrl,
-          },
+          filesUploaded: uploadedFiles.length,
+          totalFiles: pendingFiles.length,
+          message: uploadedFiles.length === pendingFiles.length 
+            ? `Alle ${uploadedFiles.length} vedlegg lastet opp til bilag ${journalEntryId}`
+            : `${uploadedFiles.length} av ${pendingFiles.length} vedlegg lastet opp til bilag ${journalEntryId}`,
+          uploadedFiles,
+          errors: errors.length > 0 ? errors : undefined,
         };
       } catch (error) {
         return {
@@ -2874,7 +2992,8 @@ Returnerer topp 5 matchende kontoer med anbefaling og MVA-info.`,
     // Accounts & Balances
     getAccounts,
     getAccountBalances,
-    searchAccountByDescription,
+    suggestAccounts,
+    getMoreAccountSuggestions,
     
     // Bank
     getBankAccounts,

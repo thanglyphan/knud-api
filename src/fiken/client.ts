@@ -116,6 +116,19 @@ interface FikenApiError {
 }
 
 /**
+ * Strip HTML tags from error messages returned by Fiken API
+ * Fiken sometimes returns HTML-formatted errors like:
+ * "Ugyldig dato: '2026-02-29'<br><br><small>Feilreferanse: abc123</small>"
+ */
+function stripHtml(text: string): string {
+  return text
+    .replace(/<br\s*\/?>/gi, ' ')           // Replace <br> with space
+    .replace(/<[^>]*>/g, '')                 // Remove all HTML tags
+    .replace(/\s+/g, ' ')                    // Collapse multiple spaces
+    .trim();
+}
+
+/**
  * Create a Fiken API client for a specific user's access token
  */
 export function createFikenClient(accessToken: string, companySlug: string) {
@@ -173,27 +186,27 @@ export function createFikenClient(accessToken: string, companySlug: string) {
 
       console.error("Fiken API error:", JSON.stringify(errorData, null, 2));
 
-      // Build detailed error message in Norwegian
+      // Build detailed error message in Norwegian (strip HTML from Fiken responses)
       let errorMessage = "";
       
       // Handle array of errors (Fiken sometimes returns an array directly)
       if (Array.isArray(errorData)) {
-        errorMessage = errorData.map((e) => e.message || JSON.stringify(e)).join("; ");
+        errorMessage = errorData.map((e) => stripHtml(e.message || JSON.stringify(e))).join("; ");
       } else {
         // Try different error formats for object responses
         if (errorData.error_description) {
-          errorMessage = errorData.error_description;
+          errorMessage = stripHtml(errorData.error_description);
         } else if (errorData.message) {
-          errorMessage = errorData.message;
+          errorMessage = stripHtml(errorData.message);
         } else if (errorData.error) {
-          errorMessage = errorData.error;
+          errorMessage = stripHtml(errorData.error);
         } else {
           errorMessage = "Ukjent feil fra Fiken API";
         }
         
         // Include field-level errors if present
         if (errorData.errors && errorData.errors.length > 0) {
-          const details = errorData.errors.map((e) => `'${e.field}': ${e.message}`).join("; ");
+          const details = errorData.errors.map((e) => `'${e.field}': ${stripHtml(e.message)}`).join("; ");
           errorMessage += `. Feltfeil: ${details}`;
         }
       }
@@ -292,9 +305,9 @@ export function createFikenClient(accessToken: string, companySlug: string) {
 
       console.error("Fiken API multipart error:", JSON.stringify(errorData, null, 2));
 
-      let errorMessage = errorData.error_description || errorData.message || "Ukjent feil ved filopplasting";
+      let errorMessage = stripHtml(errorData.error_description || errorData.message || "Ukjent feil ved filopplasting");
       if (errorData.errors && errorData.errors.length > 0) {
-        const details = errorData.errors.map((e) => `'${e.field}': ${e.message}`).join("; ");
+        const details = errorData.errors.map((e) => `'${e.field}': ${stripHtml(e.message)}`).join("; ");
         errorMessage += `. Feltfeil: ${details}`;
       }
 
