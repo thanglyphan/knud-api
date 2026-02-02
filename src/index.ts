@@ -20,9 +20,21 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Middleware
+// Middleware - CORS configuration
+const allowedOrigins = [
+  "http://localhost:8080",
+  "http://localhost:8085", 
+  "http://localhost:5173",
+  "http://localhost:3000",
+];
+
+// Add production frontend URL if configured
+if (process.env.FRONTEND_URL) {
+  allowedOrigins.push(process.env.FRONTEND_URL);
+}
+
 app.use(cors({
-  origin: ["http://localhost:8080", "http://localhost:8085", "http://localhost:5173", "http://localhost:3000"],
+  origin: allowedOrigins,
   credentials: true,
 }));
 
