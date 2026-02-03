@@ -3,14 +3,17 @@ import cors from "cors";
 import { openai } from "@ai-sdk/openai";
 import { streamText } from "ai";
 import dotenv from "dotenv";
-import { ACCOUNTING_SYSTEM_PROMPT, FIKEN_SYSTEM_PROMPT } from "./prompts.js";
+import { ACCOUNTING_SYSTEM_PROMPT, FIKEN_SYSTEM_PROMPT, TRIPLETEX_SYSTEM_PROMPT } from "./prompts.js";
 import { prisma } from "./db.js";
 import chatRoutes from "./routes/chat.js";
 import authRoutes from "./routes/auth.js";
+import configRoutes from "./routes/config.js";
 import stripeRoutes, { handleWebhook } from "./routes/stripe.js";
 import { requireAuth, requireAccountingConnection } from "./middleware/auth.js";
 import { createFikenClient } from "./fiken/client.js";
 import { createFikenTools } from "./fiken/tools/index.js";
+import { createTripletexClient } from "./tripletex/client.js";
+import { createTripletexTools } from "./tripletex/tools/index.js";
 import { convertPdfToImages } from "./utils/pdfToImage.js";
 
 import type { ChatRequest } from "./types.js";
@@ -65,6 +68,9 @@ app.get("/health", async (_req, res) => {
 // Auth routes (public)
 app.use("/api/auth", authRoutes);
 
+// Config routes (public - feature flags)
+app.use("/api/config", configRoutes);
+
 // Stripe routes (products is public, others require auth)
 app.use("/api/stripe", stripeRoutes);
 
@@ -88,11 +94,35 @@ app.get("/api/financial-summary", requireAuth, requireAccountingConnection, asyn
       const summary = await fikenClient.getFinancialSummary(fromDate, toDate);
       res.json(summary);
     } else if (provider === "tripletex") {
-      // Tripletex kommer snart - ikke tilgjengelig ennå
-      res.status(501).json({
-        error: "Tripletex-integrasjon er ikke tilgjengelig ennå",
-        message: "Kommer snart!",
-      });
+      // Tripletex financial summary - show payroll summary for current month
+      const tripletexClient = createTripletexClient(req.accountingAccessToken!, req.companyId!);
+      
+      const now = new Date();
+      const year = now.getFullYear();
+      const month = now.getMonth() + 1; // JavaScript months are 0-indexed
+      
+      try {
+        const payrollSummary = await tripletexClient.getPayrollSummary(year, month);
+        res.json({
+          provider: "tripletex",
+          period: `${year}-${String(month).padStart(2, '0')}`,
+          payroll: {
+            grossSalary: payrollSummary.totals.grossSalary,
+            taxDeduction: payrollSummary.totals.taxDeduction,
+            payrollTax: payrollSummary.totals.payrollTax,
+            netPaid: payrollSummary.totals.netPaid,
+            employeeCount: payrollSummary.employees.length,
+          },
+        });
+      } catch {
+        // If no payroll data, return empty summary
+        res.json({
+          provider: "tripletex",
+          period: `${year}-${String(month).padStart(2, '0')}`,
+          payroll: null,
+          message: "Ingen lønnsdata for denne perioden",
+        });
+      }
     } else {
       res.status(400).json({ error: "Ukjent regnskapssystem" });
     }
@@ -100,6 +130,50 @@ app.get("/api/financial-summary", requireAuth, requireAccountingConnection, asyn
     console.error("Financial summary error:", error);
     res.status(500).json({ 
       error: error instanceof Error ? error.message : "Kunne ikke hente finansoversikt" 
+    });
+  }
+});
+
+// Tripletex: Download payslip as PDF
+app.get("/api/tripletex/payslip/:id/pdf", requireAuth, requireAccountingConnection, async (req, res) => {
+  try {
+    const provider = req.accountingProvider;
+    
+    if (provider !== "tripletex") {
+      res.status(400).json({ error: "Dette endepunktet er kun for Tripletex" });
+      return;
+    }
+
+    const payslipId = parseInt(req.params.id, 10);
+    if (isNaN(payslipId)) {
+      res.status(400).json({ error: "Ugyldig lønnsslipp-ID" });
+      return;
+    }
+
+    const tripletexClient = createTripletexClient(req.accountingAccessToken!, req.companyId!);
+    
+    // Get payslip info for filename
+    const payslipInfo = await tripletexClient.getPayslip(payslipId);
+    const ps = payslipInfo.value;
+    const employeeName = ps.employee 
+      ? `${ps.employee.firstName}_${ps.employee.lastName}`.replace(/\s+/g, "_") 
+      : "ukjent";
+    const period = `${ps.year}-${String(ps.month).padStart(2, "0")}`;
+    const filename = `lonnsslipp_${employeeName}_${period}.pdf`;
+
+    // Download PDF
+    const pdfBuffer = await tripletexClient.getPayslipPdf(payslipId);
+    
+    // Set response headers for PDF download
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.setHeader("Content-Length", pdfBuffer.length);
+    
+    res.send(pdfBuffer);
+  } catch (error) {
+    console.error("Payslip PDF download error:", error);
+    res.status(500).json({ 
+      error: error instanceof Error ? error.message : "Kunne ikke laste ned lønnsslipp PDF" 
     });
   }
 });
@@ -145,12 +219,10 @@ app.post("/api/chat", requireAuth, requireAccountingConnection, async (req, res)
       tools = createFikenTools(fikenClient, req.companyId!, files);
       baseSystemPrompt = FIKEN_SYSTEM_PROMPT;
     } else if (provider === "tripletex") {
-      // Tripletex kommer snart - ikke tilgjengelig ennå
-      res.status(501).json({
-        error: "Tripletex-integrasjon er ikke tilgjengelig ennå",
-        message: "Kommer snart!",
-      });
-      return;
+      // Create Tripletex client and tools
+      const tripletexClient = createTripletexClient(req.accountingAccessToken!, req.companyId!);
+      tools = createTripletexTools(tripletexClient, req.companyId!);
+      baseSystemPrompt = TRIPLETEX_SYSTEM_PROMPT;
     } else {
       res.status(400).json({ error: "Ukjent regnskapssystem" });
       return;
