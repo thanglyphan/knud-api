@@ -2478,6 +2478,15 @@ MOTKONTO-LOGIKK:
       }),
       execute: async ({ description, amount, date, supplierName, vatRate, accountNumber, isPaid, counterAccountId, matchedPostingId }) => {
         try {
+          // 0. Validering: Beløp må være større enn 0
+          if (amount <= 0) {
+            return {
+              success: false,
+              error: "Beløp må være større enn 0 kr. Kunne ikke lese beløpet fra kvitteringen - vennligst oppgi beløpet.",
+              hint: "Spør brukeren om totalbeløpet på kvitteringen (inkl. MVA).",
+            };
+          }
+
           // 1. Få kontoforslag hvis ikke oppgitt
           let suggestedAccount = accountNumber;
           let vatInfo: { rate: number; hasDeduction: boolean } | undefined;
