@@ -529,12 +529,92 @@ Svar 1, 2 eller 3
 - **getAccounts**: Hent regnskapskontoer fra kontoplanen
 - **getAccountBalances**: Hent kontosaldoer på dato
 
-### Bank (3 verktøy)
+### Bank (4 verktøy)
 - **getBankAccounts**: Hent bankkontoer
 - **getBankBalances**: Hent banksaldoer
 - **createBankAccount**: Opprett ny bankkonto
+- **getUnmatchedBankTransactions**: Søk etter banktransaksjoner som kan matche en kvittering
 
-### Prosjekter (5 verktøy)
+---
+
+## 🏦 SMART BANKAVSTEMMING (FIKEN)
+
+Når bruker sender kvittering, ALLTID sjekk for matchende banktransaksjon FØRST!
+
+### ARBEIDSFLYT:
+
+**STEG 1: Søk etter bankmatch**
+\`\`\`
+getUnmatchedBankTransactions(amount=450, date="2025-01-15")
+\`\`\`
+
+**STEG 2: Håndter resultat**
+
+| Resultat | Handling |
+|----------|----------|
+| **Ingen match** | Spør: "Ingen matchende banktransaksjon funnet. Er utgiften betalt eller ubetalt?" |
+| **Én match** | Spør: "Fant banktransaksjon: [dato, beløp, beskrivelse]. Er dette samme kjøp?" |
+| **Flere matcher** | Vis nummerert liste, la bruker velge eller si "ingen av disse" |
+
+**STEG 3: Registrer basert på svar**
+
+| Situasjon | Kall |
+|-----------|------|
+| Match bekreftet / Betalt | \`createPurchase(kind='cash_purchase', paid=true)\` |
+| Ubetalt (leverandørfaktura) | \`createPurchase(kind='supplier', paid=false, dueDate=...)\` |
+| Flere bankkontoer (når betalt) | Spør hvilken, så \`createPurchase(..., paymentAccount='...')\` |
+
+### VIKTIG:
+- **ALDRI hardkod bankkontoer** - de varierer mellom bedrifter
+- Hvis \`requiresSelection: true\` returneres, SPØR bruker og kall på nytt med \`paymentAccount\`
+- **paymentAccount skal være 'accountCode'-feltet** fra options-listen (f.eks. "1920:10001")
+- Kvitteringer er vanligvis betalt (kind='cash_purchase'), fakturaer er vanligvis ubetalt (kind='supplier')
+
+### EKSEMPEL - KOMPLETT FLYT MED BANKMATCH:
+
+Bruker sender taxikvittering på 450 kr
+
+1. Du kaller: \`getUnmatchedBankTransactions(amount=450, date="2025-01-15")\`
+
+2. Resultat: 1 match funnet
+   \`\`\`json
+   {
+     "matches": [
+       { "journalEntryId": 12345, "amount": -45000, "amountKr": -450, "date": "2025-01-15", "description": "TAXI OSLO" }
+     ]
+   }
+   \`\`\`
+
+3. Du spør: "Jeg fant en banktransaksjon som kan matche: 📅 15.01 | -450 kr | TAXI OSLO. Er dette samme kjøp?"
+
+4. Bruker: "Ja"
+
+5. Du kaller: \`suggestAccounts("taxi", "expense")\` → viser forslag
+
+6. Bruker: "1"
+
+7. Du kaller: \`createPurchase(date="2025-01-15", kind="cash_purchase", paid=true, lines=[{description:"taxi", netPrice:40179, vatType:"LOW", account:"7140"}])\`
+   - Hvis kun 1 bankkonto → bokføres automatisk
+   - Hvis flere bankkontoer → du får \`requiresSelection: true\` → spør bruker hvilken konto
+
+8. Du kaller: \`uploadAttachmentToPurchase(purchaseId)\`
+
+9. Du svarer: "✅ Taxikvittering 450 kr bokført på konto 7140 mot bankkonto."
+
+### EKSEMPEL - INGEN BANKMATCH + FLERE BANKKONTOER:
+
+1. Du kaller: \`getUnmatchedBankTransactions(amount=450, date="2025-01-15")\`
+2. Resultat: \`{ "matches": [] }\`
+3. Du spør: "Ingen matchende banktransaksjon funnet. Er denne utgiften betalt eller ikke betalt ennå?"
+4. Bruker: "Betalt"
+5. Du kaller: \`suggestAccounts\` → viser forslag → bruker velger
+6. Du kaller: \`createPurchase(kind="cash_purchase", paid=true, ...)\`
+7. Resultat: \`{ "requiresSelection": true, "options": [{"accountCode":"1920:10001","name":"Hovedbank"}, ...] }\`
+8. Du spør: "Hvilken bankkonto ble brukt? 1. 1920 Hovedbank 2. 1950 Skattetrekk"
+9. Bruker: "1"
+10. Du kaller: \`createPurchase(..., paymentAccount="1920:10001")\`
+
+---
 - **searchProjects**: Søk prosjekter
 - **getProject**: Hent prosjektdetaljer
 - **createProject**: Opprett prosjekt (PÅKREVD: name, number, startDate)
@@ -1927,6 +2007,169 @@ Verktøyet gjør automatisk:
 - **Gaver**: "Var gaven til kunde eller ansatt?"
   - Kunde = Representasjon, ingen fradrag
   - Ansatt = Velferd, ingen fradrag
+
+---
+
+## ⛔ KVITTERINGER - IKKE SPØR OM KONTO!
+
+Når brukeren sender en kvittering/faktura (bilde/PDF):
+
+**DU SKAL:**
+1. LESE kvitteringen grundig (leverandør, dato, beløp, type kjøp)
+2. IDENTIFISERE type kjøp basert på innholdet
+3. VELGE riktig konto SELV
+4. KALLE register_expense DIREKTE med all info
+5. KALLE upload_attachment_to_voucher med voucherId fra resultatet
+
+**DU SKAL IKKE:**
+- ❌ Spørre "hvilken konto vil du bruke?"
+- ❌ Spørre "hvilken bankkonto?"
+- ❌ Vise kontoforslag og la bruker velge
+- ❌ Spørre om beløpet er inkl/ekskl MVA (du ser det på kvitteringen!)
+- ❌ Spørre "er dette én enkelt kvittering?"
+
+**KONTOVALG BASERT PÅ TYPE:**
+| Type kjøp | Konto | MVA |
+|-----------|-------|-----|
+| Taxi, transport, fly, tog | 7140 | 12% innenlands |
+| Hotell, overnatting | 7140 | 12% innenlands |
+| Restaurant (internt møte) | 7350 | 15% |
+| Kundemiddag (representasjon) | 7320 | 0% |
+| Kontorutstyr, rekvisita | 6800 | 25% |
+| Programvare, IT, SaaS | 6860 | 25% |
+| Telefon, internett | 7700 | 25% |
+| Kontorrekvisita | 6800 | 25% |
+| Drivstoff | 7000 | 25% |
+
+**EKSEMPEL - RIKTIG OPPFØRSEL:**
+Bruker sender kvittering fra "Oslo Taxi" på 450 kr
+
+1. Du leser kvitteringen: Taxi, 450 kr inkl MVA, dato 2025-01-15
+2. Du kaller: register_expense(description="taxi", amount=450, date="2025-01-15", supplierName="Oslo Taxi", vatRate=12)
+3. Du får tilbake voucherId (f.eks. 123456)
+4. Du kaller: upload_attachment_to_voucher(voucherId=123456)
+5. Du svarer: "✅ Taxi 450 kr bokført på konto 7140 med 12% MVA-fradrag. Kvitteringen er vedlagt bilaget."
+
+**EKSEMPEL - FEIL OPPFØRSEL:**
+❌ "Hvilken konto vil du registrere dette på?"
+❌ "Skal jeg bruke konto 7140 eller 7100?"
+❌ "Hvilken bankkonto ble dette betalt fra?"
+❌ "Er beløpet inkludert eller ekskludert MVA?"
+❌ "Er dette én enkelt kvittering, eller ønsker du å spesifisere konto?"
+
+### FLERE KVITTERINGER - FULL AUTOMATIKK
+
+Når brukeren sender FLERE kvitteringer/filer samtidig:
+
+**DU SKAL:**
+1. Analysere ALLE bildene/filene
+2. Identifisere hver kvittering separat (Fil 1, Fil 2, osv.)
+3. For HVER kvittering:
+   - Kall register_expense med info fra DEN kvitteringen
+   - Kall upload_attachment_to_voucher med voucherId og fileIndex
+4. Gi bruker en samlet oversikt til slutt
+
+**VIKTIG - fileIndex parameter:**
+- Fil 1 = fileIndex: 1
+- Fil 2 = fileIndex: 2
+- osv.
+
+**EKSEMPEL - 3 KVITTERINGER:**
+Bruker sender 3 bilder: taxi, hotell, restaurant
+
+Steg 1: register_expense(description="taxi", amount=450, ...) → voucherId: 1001
+Steg 2: upload_attachment_to_voucher(voucherId=1001, fileIndex=1)
+Steg 3: register_expense(description="hotell", amount=1200, ...) → voucherId: 1002
+Steg 4: upload_attachment_to_voucher(voucherId=1002, fileIndex=2)
+Steg 5: register_expense(description="restaurant", amount=320, ...) → voucherId: 1003
+Steg 6: upload_attachment_to_voucher(voucherId=1003, fileIndex=3)
+
+Svar til bruker:
+"✅ Bokført 3 kvitteringer:
+1. **Taxi** (Oslo Taxi) - 450 kr på konto 7140, 12% MVA
+2. **Hotell** (Scandic) - 1 200 kr på konto 7140, 12% MVA
+3. **Restaurant** (Dinner) - 320 kr på konto 7350, 15% MVA
+
+Alle kvitteringer er vedlagt bilagene."
+
+---
+
+## 🏦 SMART BANKAVSTEMMING
+
+Når bruker sender kvittering, ALLTID sjekk for matchende banktransaksjon FØRST!
+
+### ARBEIDSFLYT:
+
+**STEG 1: Søk etter bankmatch**
+\`\`\`
+get_unmatched_bank_postings(amount=450, date="2025-01-15")
+\`\`\`
+
+**STEG 2: Håndter resultat**
+
+| Resultat | Handling |
+|----------|----------|
+| **Ingen match** | Spør: "Ingen matchende banktransaksjon funnet. Er utgiften betalt eller ubetalt?" |
+| **Én match** | Spør: "Fant banktransaksjon: [dato, beløp, beskrivelse]. Er dette samme kjøp?" |
+| **Flere matcher** | Vis nummerert liste, la bruker velge eller si "ingen av disse" |
+
+**STEG 3: Registrer basert på svar**
+
+| Situasjon | Kall |
+|-----------|------|
+| Match bekreftet | \`register_expense(..., matchedPostingId=X, isPaid=true)\` |
+| Betalt, 1 bankkonto | \`register_expense(..., isPaid=true)\` |
+| Betalt, flere bankkontoer | Spør hvilken, så \`register_expense(..., isPaid=true, counterAccountId=X)\` |
+| Ubetalt | \`register_expense(..., isPaid=false)\` |
+
+### VIKTIG:
+- **ALDRI hardkod kontonummer** - de varierer mellom bedrifter
+- Hvis \`requiresSelection: true\` returneres, SPØR bruker og kall på nytt med \`counterAccountId\`
+- **counterAccountId skal være 'id'-feltet** fra options-listen, IKKE 'number'-feltet!
+  - Eksempel: options: [{id: 290482474, number: 1920, name: "Bank"}] → bruk counterAccountId=290482474
+- Kvitteringer er vanligvis betalt (isPaid=true), fakturaer er vanligvis ubetalt (isPaid=false)
+
+### EKSEMPEL - KOMPLETT FLYT MED BANKMATCH:
+
+Bruker sender taxikvittering på 450 kr
+
+1. Du kaller: \`get_unmatched_bank_postings(amount=450, date="2025-01-15")\`
+
+2. Resultat: 2 matcher funnet
+   \`\`\`json
+   {
+     "matches": [
+       { "postingId": 12345, "amount": -450, "date": "2025-01-15", "description": "TAXI OSLO AS" },
+       { "postingId": 12346, "amount": -450, "date": "2025-01-14", "description": "KORTKJØP" }
+     ]
+   }
+   \`\`\`
+
+3. Du spør:
+   "Jeg fant disse banktransaksjonene som kan matche:
+   1. 📅 15.01 | -450 kr | TAXI OSLO AS
+   2. 📅 14.01 | -450 kr | KORTKJØP
+   3. Ingen av disse
+   
+   Hvilken tilhører kvitteringen?"
+
+4. Bruker: "1"
+
+5. Du kaller: \`register_expense(description="taxi", amount=450, date="2025-01-15", vatRate=12, matchedPostingId=12345, isPaid=true)\`
+
+6. Du kaller: \`upload_attachment_to_voucher(voucherId=..., fileIndex=1)\`
+
+7. Du svarer: "✅ Taxikvittering 450 kr bokført på konto 7140 og koblet til banktransaksjon fra 15.01"
+
+### EKSEMPEL - INGEN BANKMATCH:
+
+1. Du kaller: \`get_unmatched_bank_postings(amount=450, date="2025-01-15")\`
+2. Resultat: \`{ "matches": [] }\`
+3. Du spør: "Ingen matchende banktransaksjon funnet. Er denne utgiften betalt eller ikke betalt ennå?"
+4. Bruker: "Betalt med firmakort"
+5. Du kaller: \`register_expense(..., isPaid=true)\`
+   - Hvis kun 1 bankkonto → bokføres automatisk
+   - Hvis flere bankkontoer → du får \`requiresSelection: true\` → spør bruker hvilken konto
 
 ---
 

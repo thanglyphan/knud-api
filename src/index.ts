@@ -221,7 +221,7 @@ app.post("/api/chat", requireAuth, requireAccountingConnection, async (req, res)
     } else if (provider === "tripletex") {
       // Create Tripletex client and tools
       const tripletexClient = createTripletexClient(req.accountingAccessToken!, req.companyId!);
-      tools = createTripletexTools(tripletexClient, req.companyId!);
+      tools = createTripletexTools(tripletexClient, req.companyId!, files);
       baseSystemPrompt = TRIPLETEX_SYSTEM_PROMPT;
     } else {
       res.status(400).json({ error: "Ukjent regnskapssystem" });
@@ -306,12 +306,57 @@ IKKE spør brukeren om å sende fil${files.length > 1 ? 'ene' : 'en'} på nytt -
           const contentParts: Array<
             | { type: "text"; text: string }
             | { type: "image"; image: string }
-          > = [
-            { 
-              type: "text", 
-              text: `${textContent}\n\n📎 **Vedlagte filer (${files.length} stk):** ${fileNames}\n[ANALYSER ALLE vedlagte bilder/filer. Hvis FLERE kvitteringer/fakturaer: 1) Les av info fra HVER fil separat 2) Presenter ALLE i nummerert oversikt (Fil 1, Fil 2, osv.) 3) Sjekk om noen filer ser ut til å være SAMME kvittering - spør brukeren! 4) Spør om alle skal registreres som separate kjøp 5) La brukeren velge om alle skal ha samme konto. For HVER fil: Identifiser leverandør, dato, beløp, MVA, beskrivelse, betalingsstatus. ⛔ IKKE spør om inkl/ekskl MVA hvis du ser MVA-info! 📌 ALLTID spør hvilken bankkonto for betalte kjøp!]` 
-            }
-          ];
+          > = [];
+          
+          // Provider-specific file instructions
+          let fileInstructions: string;
+          if (provider === "fiken") {
+            // Fiken: Ask user about accounts, bank accounts, etc.
+            fileInstructions = `[ANALYSER ALLE vedlagte bilder/filer. Hvis FLERE kvitteringer/fakturaer: 1) Les av info fra HVER fil separat 2) Presenter ALLE i nummerert oversikt (Fil 1, Fil 2, osv.) 3) Sjekk om noen filer ser ut til å være SAMME kvittering - spør brukeren! 4) Spør om alle skal registreres som separate kjøp 5) La brukeren velge om alle skal ha samme konto. For HVER fil: Identifiser leverandør, dato, beløp, MVA, beskrivelse, betalingsstatus. ⛔ IKKE spør om inkl/ekskl MVA hvis du ser MVA-info! 📌 ALLTID spør hvilken bankkonto for betalte kjøp!]`;
+          } else if (provider === "tripletex") {
+            // Tripletex: Smart bank reconciliation + automatic processing
+            fileInstructions = `[ANALYSER ALLE ${files.length} vedlagte kvitteringer GRUNDIG.
+
+🏦 STEG 1 - SØK BANKMATCH (for HVER kvittering):
+Kall get_unmatched_bank_postings(amount=X, date="YYYY-MM-DD") for å finne matchende banktransaksjoner.
+
+📋 STEG 2 - HÅNDTER RESULTAT:
+- INGEN MATCH: Spør "Er dette betalt eller ubetalt?"
+- ÉN MATCH: Spør "Fant [dato, beløp, beskrivelse]. Er dette samme kjøp?"
+- FLERE MATCHER: Vis nummerert liste, la bruker velge
+
+📝 STEG 3 - REGISTRER:
+Kall register_expense med:
+- matchedPostingId (hvis bankmatch bekreftet)
+- isPaid=true (betalt) eller isPaid=false (ubetalt/faktura)
+- counterAccountId (hvis flere bankkontoer og bruker har valgt)
+
+📎 STEG 4 - LAST OPP:
+Kall upload_attachment_to_voucher(voucherId, fileIndex=N)
+
+KONTOVALG:
+- Taxi/transport/fly/tog → 7140, 12% MVA
+- Hotell/overnatting → 7140, 12% MVA  
+- Restaurant (internt) → 7350, 15% MVA
+- Kundemiddag/representasjon → 7320, 0% MVA
+- Kontor/utstyr/rekvisita → 6800, 25% MVA
+- Programvare/IT → 6860, 25% MVA
+- Telefon/internett → 7700, 25% MVA
+
+${files.length > 1 ? `VIKTIG - DU HAR ${files.length} FILER:
+Behandle HVER fil separat!
+Fil 1 = fileIndex 1, Fil 2 = fileIndex 2, osv.` : ''}
+
+ALDRI spør om kostnadskonto eller MVA-sats - velg selv!
+MEN spør om bankmatch og betalt/ubetalt status.]`;
+          } else {
+            fileInstructions = `[Analyser vedlagte filer]`;
+          }
+          
+          contentParts.push({ 
+            type: "text", 
+            text: `${textContent}\n\n📎 **Vedlagte filer (${files.length} stk):** ${fileNames}\n${fileInstructions}` 
+          });
           
           // Add images (max 4 to avoid token limits)
           const maxImages = Math.min(imageDataUrls.length, 4);
@@ -344,7 +389,7 @@ IKKE spør brukeren om å sende fil${files.length > 1 ? 'ene' : 'en'} på nytt -
       system: systemPromptWithDate,
       messages: processedMessages as Parameters<typeof streamText>[0]["messages"],
       tools,
-      maxSteps: 10,
+      maxSteps: 25, // Increased to support multiple receipts (each needs register + upload)
       toolChoice: "auto", // Ensure tool calling is enabled
       onStepFinish: ({ stepType, toolCalls, toolResults }) => {
         console.log(`[AI] Step finished: ${stepType}`);

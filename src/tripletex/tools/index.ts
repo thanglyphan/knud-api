@@ -15,7 +15,11 @@ import { createContactMatcher } from "../subagents/contactMatcher.js";
 /**
  * Create Tripletex tools for the AI agent
  */
-export function createTripletexTools(client: TripletexClient, companyId: string) {
+export function createTripletexTools(
+  client: TripletexClient, 
+  companyId: string,
+  pendingFiles?: Array<{ name: string; type: string; data: string }>
+) {
   return {
     // ==================== EMPLOYEES ====================
     
@@ -1572,8 +1576,10 @@ Vanlig bilagsstruktur:
             if (!accountInfo) {
               throw new Error(`Konto ${p.accountNumber} finnes ikke i kontoplanen`);
             }
+            // NOTE: Bruker sekvensielle row-numre her. For enkel debet/kredit-visning på samme rad,
+            // kan row settes til samme verdi (se register_expense for eksempel).
             return {
-              row: index + 1,  // VIKTIG: Start på 1! Row 0 er reservert for systemgenererte posteringer!
+              row: index + 1,  // Starter på 1 (row 0 er reservert for systemgenererte posteringer)
               date: date,  // Posteringsdato
               account: { id: accountInfo.id },
               amountGross: p.amount,
@@ -2329,9 +2335,120 @@ MERK: Må først opprette en ordre, deretter fakturere den.`,
 
     // ==================== SMART TOOLS (Kombinerer flere operasjoner) ====================
 
+    get_unmatched_bank_postings: tool({
+      description: `Søk etter banktransaksjoner som kan matche en kvittering/utgift.
+BRUK DETTE FØR register_expense for å sjekke om det finnes en matchende banktransaksjon.
+
+Søker etter posteringer på bankkontoer som matcher:
+- Beløpet fra kvitteringen (±5 kr margin for avrunding)
+- Datoperiode rundt kvitteringsdato (±daysRange dager)
+
+Returnerer liste over potensielle matcher som du kan vise til bruker.
+
+VIKTIG: Negativt beløp på bankkonto = utbetaling/utgift`,
+      parameters: z.object({
+        amount: z.number().describe("Beløpet fra kvitteringen (positiv verdi, f.eks. 450)"),
+        date: z.string().describe("Datoen fra kvitteringen (YYYY-MM-DD)"),
+        daysRange: z.number().optional().default(5).describe("Antall dager ± å søke (default 5)"),
+      }),
+      execute: async ({ amount, date, daysRange = 5 }) => {
+        try {
+          // 1. Beregn dato-range
+          const targetDate = new Date(date);
+          const dateFrom = new Date(targetDate);
+          dateFrom.setDate(dateFrom.getDate() - daysRange);
+          const dateTo = new Date(targetDate);
+          dateTo.setDate(dateTo.getDate() + daysRange);
+          
+          const dateFromStr = dateFrom.toISOString().split('T')[0];
+          const dateToStr = dateTo.toISOString().split('T')[0];
+          
+          // 2. Hent alle bankkontoer
+          const accountsResult = await client.getAccounts({ count: 1000 });
+          const bankAccounts = accountsResult.values.filter(a => a.isBankAccount && !a.isInactive);
+          
+          if (bankAccounts.length === 0) {
+            return { 
+              success: true, 
+              matches: [], 
+              message: "Ingen aktive bankkontoer funnet i kontoplanen.",
+              bankAccounts: [],
+            };
+          }
+          
+          // 3. Hent posteringer i perioden
+          const postingsResult = await client.getPostings({
+            dateFrom: dateFromStr,
+            dateTo: dateToStr,
+            count: 500,
+          });
+          
+          // 4. Filtrer til bankkontoer og matchende beløp
+          const bankAccountIds = bankAccounts.map(a => a.id);
+          const matches = postingsResult.values.filter(p => {
+            // Må være på en bankkonto
+            if (!p.account || !bankAccountIds.includes(p.account.id)) return false;
+            
+            // Beløp må matche (negativt på bank = utbetaling)
+            // Kvitteringsbeløp er positivt, bankutbetaling er negativt
+            const postingAmount = Math.abs(p.amount || 0);
+            return Math.abs(postingAmount - amount) <= 5; // ±5 kr margin
+          });
+          
+          // Sorter etter hvor nært datoen er
+          matches.sort((a, b) => {
+            const aDate = new Date(a.date || '');
+            const bDate = new Date(b.date || '');
+            const aDiff = Math.abs(aDate.getTime() - targetDate.getTime());
+            const bDiff = Math.abs(bDate.getTime() - targetDate.getTime());
+            return aDiff - bDiff;
+          });
+          
+          return {
+            success: true,
+            matchCount: matches.length,
+            matches: matches.slice(0, 10).map(p => ({
+              postingId: p.id,
+              voucherId: p.voucher?.id,
+              voucherNumber: p.voucher?.number,
+              date: p.date,
+              amount: p.amount,
+              description: p.description || p.voucher?.description || "(ingen beskrivelse)",
+              accountNumber: p.account?.number,
+              accountName: p.account?.name,
+            })),
+            searchCriteria: {
+              amount,
+              targetDate: date,
+              dateFrom: dateFromStr,
+              dateTo: dateToStr,
+              marginKr: 5,
+            },
+            bankAccounts: bankAccounts.map(a => ({ 
+              id: a.id, 
+              number: a.number, 
+              name: a.name,
+            })),
+            hint: matches.length === 0 
+              ? "Ingen matchende banktransaksjoner funnet. Spør bruker om utgiften er betalt eller ubetalt."
+              : matches.length === 1
+                ? "Én match funnet. Spør bruker om dette er samme kjøp."
+                : `${matches.length} matcher funnet. Vis liste og la bruker velge.`,
+          };
+        } catch (error) {
+          return {
+            success: false,
+            error: error instanceof Error ? error.message : "Feil ved søk etter bankposteringer",
+          };
+        }
+      },
+    }),
+
     register_expense: tool({
       description: `SMART TOOL: Registrer en utgift/kvittering med AI-assistanse.
 Kombinerer kontoforslag, MVA-vurdering og bilagsopprettelse.
+
+VIKTIG: Bruk get_unmatched_bank_postings FØR denne for å sjekke bankmatching!
 
 Bruk dette når brukeren sier ting som:
 - "Jeg har en kvittering på 500 kr for taxi"
@@ -2341,7 +2458,13 @@ Bruk dette når brukeren sier ting som:
 AI-en vil:
 1. Foreslå riktig konto basert på beskrivelsen
 2. Vurdere MVA-behandling
-3. Opprette bilaget med riktige posteringer`,
+3. Bestemme motkonto (bank eller leverandørgjeld)
+4. Opprette bilaget med riktige posteringer
+
+MOTKONTO-LOGIKK:
+- isPaid=true → motkonto blir bankkonto (hentes fra kontoplan)
+- isPaid=false → motkonto blir leverandørgjeld (hentes fra kontoplan)
+- Hvis flere bankkontoer finnes, bruk counterAccountId for å spesifisere`,
       parameters: z.object({
         description: z.string().describe("Beskrivelse av utgiften (f.eks. 'taxi til flyplass', 'programvare')"),
         amount: z.number().describe("Beløp inkl. MVA"),
@@ -2349,8 +2472,11 @@ AI-en vil:
         supplierName: z.string().optional().describe("Leverandørnavn (valgfritt)"),
         vatRate: z.number().optional().describe("MVA-sats hvis kjent (25, 15, 12, eller 0)"),
         accountNumber: z.number().optional().describe("Kontonummer hvis kjent (overstyrer AI-forslag)"),
+        isPaid: z.boolean().optional().describe("Er utgiften allerede betalt? true = motkonto bank, false = motkonto leverandørgjeld. Default: true for kvitteringer."),
+        counterAccountId: z.number().optional().describe("Spesifikk motkonto-ID (IKKE kontonummer!). Bruk 'id'-feltet fra bankAccount-listen i requiresSelection-responsen."),
+        matchedPostingId: z.number().optional().describe("ID til matchende bankpostering fra get_unmatched_bank_postings. For referanse/sporing."),
       }),
-      execute: async ({ description, amount, date, supplierName, vatRate, accountNumber }) => {
+      execute: async ({ description, amount, date, supplierName, vatRate, accountNumber, isPaid, counterAccountId, matchedPostingId }) => {
         try {
           // 1. Få kontoforslag hvis ikke oppgitt
           let suggestedAccount = accountNumber;
@@ -2386,9 +2512,17 @@ AI-en vil:
           let supplierId: number | undefined;
           if (supplierName) {
             const contactMatcher = createContactMatcher(client);
-            const supplierResult = await contactMatcher.findSupplier(supplierName);
-            if (supplierResult.found && supplierResult.contact) {
-              supplierId = supplierResult.contact.id;
+            
+            // Hvis isPaid=false, vi MÅ ha en leverandør - opprett hvis ikke funnet
+            if (isPaid === false) {
+              const supplierResult = await contactMatcher.findOrCreateSupplier({ name: supplierName });
+              supplierId = supplierResult.id;
+            } else {
+              // For betalte utgifter, bare finn eksisterende (ikke opprett)
+              const supplierResult = await contactMatcher.findSupplier(supplierName);
+              if (supplierResult.found && supplierResult.contact) {
+                supplierId = supplierResult.contact.id;
+              }
             }
           }
 
@@ -2451,38 +2585,98 @@ AI-en vil:
           const actualNetAmount = Math.round((amount / (1 + actualVatRate / 100)) * 100) / 100;
           const actualVatAmount = Math.round((amount - actualNetAmount) * 100) / 100;
 
-          // 5. Bestem motkonto (leverandørgjeld eller bank)
-          // Konto 2400 = Leverandørgjeld, 1920 = Bank
-          const contraAccountNumber = supplierId ? 2400 : 1920;
-          const contraAccount = accountsResult.values.find(a => a.number === contraAccountNumber);
+          // 5. Bestem motkonto (bank eller leverandørgjeld) - SMART LOGIKK
+          let contraAccount: { id: number; number?: number; name?: string };
           
-          if (!contraAccount) {
-            return {
-              success: false,
-              error: `Motkonto ${contraAccountNumber} finnes ikke i kontoplanen. Vennligst oppgi en motkonto manuelt.`,
-            };
+          if (counterAccountId) {
+            // Bruker har spesifisert en spesifikk motkonto
+            const specifiedAccount = accountsResult.values.find(a => a.id === counterAccountId);
+            if (!specifiedAccount) {
+              return {
+                success: false,
+                error: `Motkonto med ID ${counterAccountId} finnes ikke.`,
+              };
+            }
+            contraAccount = { id: specifiedAccount.id, number: specifiedAccount.number, name: specifiedAccount.name };
+            
+          } else if (isPaid !== false) {
+            // BETALT (default for kvitteringer) - finn bankkonto
+            const bankAccounts = accountsResult.values.filter(a => a.isBankAccount && !a.isInactive);
+            
+            if (bankAccounts.length === 0) {
+              return {
+                success: false,
+                error: "Ingen bankkontoer funnet i kontoplanen. Opprett en bankkonto først, eller oppgi counterAccountId manuelt.",
+              };
+            } else if (bankAccounts.length === 1) {
+              // Kun én bankkonto - bruk den
+              contraAccount = { id: bankAccounts[0].id, number: bankAccounts[0].number, name: bankAccounts[0].name };
+            } else {
+              // Flere bankkontoer - returner liste så AI kan spørre bruker
+              return {
+                success: false,
+                requiresSelection: true,
+                selectionType: "bankAccount",
+                options: bankAccounts.map(a => ({ id: a.id, number: a.number, name: a.name })),
+                message: `Flere bankkontoer funnet (${bankAccounts.length} stk). Spør bruker hvilken som ble brukt for denne betalingen, og kall register_expense igjen med counterAccountId satt til 'id'-verdien (IKKE 'number'!) fra valgt konto.`,
+              };
+            }
+            
+          } else {
+            // IKKE BETALT - finn leverandørgjeld-konto (24XX-serien)
+            const apAccounts = accountsResult.values.filter(a => 
+              a.number && a.number >= 2400 && a.number < 2500 && !a.isInactive
+            );
+            
+            if (apAccounts.length === 0) {
+              return {
+                success: false,
+                error: "Ingen leverandørgjeld-konto funnet (2400-2499) i kontoplanen.",
+              };
+            }
+            // Velg 2400 hvis den finnes, ellers første tilgjengelige
+            const chosen = apAccounts.find(a => a.number === 2400) || apAccounts[0];
+            contraAccount = { id: chosen.id, number: chosen.number, name: chosen.name };
           }
 
           // 6. Opprett bilag med riktig format for Tripletex
           // VIKTIG: row må starte på 1, IKKE 0! Row 0 er reservert for systemgenererte posteringer!
           
+          // Hvis isPaid=false (leverandørgjeld), krever Tripletex en leverandør-ID på posteringen
+          let supplierForPosting: { id: number } | undefined;
+          if (isPaid === false) {
+            // Krever leverandør for leverandørgjeld
+            if (!supplierId) {
+              return {
+                success: false,
+                error: "For ubetalt utgift (leverandørgjeld) kreves leverandørnavn. Oppgi supplierName eller bruk isPaid=true for betalte utgifter.",
+                hint: "Tripletex krever en leverandør når du bokfører mot leverandørgjeld (2400-serien). Enten oppgi leverandørnavn, eller marker utgiften som betalt (isPaid=true) for å bokføre mot bank i stedet.",
+              };
+            }
+            supplierForPosting = { id: supplierId };
+          }
+          
+          // POSTERINGER: Bruker row: 1 for begge slik at de vises på SAMME RAD i Tripletex UI
+          // (Debet og Kredit kolonner fylles ut på én linje, i stedet for to separate rader)
           const postings = [
-            // Kostnadskonto (debet)
+            // Kostnadskonto (debet - positivt beløp)
             {
-              row: 1,  // VIKTIG: Start på 1!
+              row: 1,
               date: date,
               account: { id: account.id },
               amountGross: amount,
               amountGrossCurrency: amount,
               vatType: vatType ? { id: vatType.id } : undefined,
+              supplier: supplierForPosting,
             },
-            // Motkonto (kredit)
+            // Motkonto (kredit - negativt beløp)
             {
-              row: 2,  // VIKTIG: Fortsett med 2!
+              row: 1,  // Samme row = grupperes på samme linje i Tripletex UI
               date: date,
               account: { id: contraAccount.id },
               amountGross: -amount,
               amountGrossCurrency: -amount,
+              supplier: supplierForPosting,
             },
           ];
 
@@ -2508,12 +2702,15 @@ AI-en vil:
             },
             details: {
               account: `${account.number} - ${account.name}`,
+              contraAccount: `${contraAccount.number} - ${contraAccount.name}`,
               netAmount: actualNetAmount,
               vatAmount: actualVatAmount,
               vatRate: actualVatRate,
               totalAmount: amount,
               supplier: supplierName,
               hasVatDeduction: actualVatAmount > 0,
+              isPaid: isPaid !== false,
+              matchedPostingId: matchedPostingId,
             },
           };
         } catch (error) {
@@ -2587,6 +2784,76 @@ Søker først etter eksisterende kontakt, og oppretter ny hvis ikke funnet.`,
           return {
             success: false,
             error: error instanceof Error ? error.message : "Ukjent feil ved kontakthåndtering",
+          };
+        }
+      },
+    }),
+
+    // ==================== FILE ATTACHMENTS ====================
+
+    upload_attachment_to_voucher: tool({
+      description: `Last opp kvittering/vedlegg til et bilag.
+Kalles AUTOMATISK etter register_expense eller create_voucher.
+Laster opp filen(e) som brukeren har vedlagt til bilaget.
+
+VIKTIG: Kall dette verktøyet UMIDDELBART etter at et bilag er opprettet!`,
+      parameters: z.object({
+        voucherId: z.number().describe("Bilags-ID fra register_expense eller create_voucher"),
+        fileIndex: z.number().optional().describe("Hvilken fil (1-basert). Hvis ikke oppgitt, lastes alle filer opp."),
+      }),
+      execute: async ({ voucherId, fileIndex }) => {
+        try {
+          if (!pendingFiles || pendingFiles.length === 0) {
+            return {
+              success: false,
+              error: "Ingen filer vedlagt. Brukeren må sende fil sammen med meldingen.",
+            };
+          }
+
+          const filesToUpload = fileIndex 
+            ? [pendingFiles[fileIndex - 1]]
+            : pendingFiles;
+
+          if (fileIndex && !pendingFiles[fileIndex - 1]) {
+            return {
+              success: false,
+              error: `Fil ${fileIndex} finnes ikke. Det er ${pendingFiles.length} fil(er) vedlagt.`,
+            };
+          }
+
+          const uploadedFiles: string[] = [];
+          const errors: string[] = [];
+
+          for (const file of filesToUpload) {
+            try {
+              // Remove data URL prefix and convert to Buffer
+              const base64Data = file.data.replace(/^data:[^;]+;base64,/, "");
+              const buffer = Buffer.from(base64Data, "base64");
+              
+              await client.uploadVoucherAttachment(voucherId, buffer, file.name);
+              uploadedFiles.push(file.name);
+            } catch (error) {
+              errors.push(`${file.name}: ${error instanceof Error ? error.message : "Ukjent feil"}`);
+            }
+          }
+
+          if (uploadedFiles.length === 0) {
+            return {
+              success: false,
+              error: `Kunne ikke laste opp noen filer: ${errors.join("; ")}`,
+            };
+          }
+
+          return {
+            success: true,
+            message: `${uploadedFiles.length} fil(er) lastet opp til bilag ${voucherId}`,
+            uploadedFiles,
+            errors: errors.length > 0 ? errors : undefined,
+          };
+        } catch (error) {
+          return {
+            success: false,
+            error: error instanceof Error ? error.message : "Ukjent feil ved opplasting",
           };
         }
       },

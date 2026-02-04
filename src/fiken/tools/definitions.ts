@@ -809,10 +809,23 @@ export function createFikenTools(client: FikenClient, companySlug: string, pendi
   });
 
   const createPurchase = tool({
-    description: "Registrer et nytt kjøp/leverandørfaktura i Fiken. KRITISK: Kall ALLTID suggestAccounts FØRST, vis 3 forslag til brukeren, og VENT på brukerens valg før du registrerer! PÅKREVD: date, kind, paid, lines, currency. For kontantkjøp: kind='cash_purchase', paid=true, paymentAccount. For leverandørfaktura: kind='supplier', paid=false, dueDate.",
+    description: `Registrer et nytt kjøp/leverandørfaktura i Fiken.
+
+VIKTIG: Kall getUnmatchedBankTransactions FØR dette for å sjekke bankmatching!
+
+PÅKREVD: date, kind, paid, lines, currency.
+- For kontantkjøp (betalt): kind='cash_purchase', paid=true
+- For leverandørfaktura (ubetalt): kind='supplier', paid=false, dueDate
+
+SMART BANKKONTO-LOGIKK:
+- Hvis paymentAccount IKKE oppgis og kind='cash_purchase':
+  - Henter automatisk bankkontoer
+  - Hvis kun 1 bankkonto: bruker den automatisk
+  - Hvis flere: returnerer requiresSelection med liste
+- Oppgi paymentAccount for å spesifisere bankkonto direkte`,
     parameters: z.object({
       date: z.string().describe("Kjøpsdato (YYYY-MM-DD)"),
-      kind: z.enum(["cash_purchase", "supplier"]).describe("Type: 'cash_purchase' (kontantkjøp) eller 'supplier' (leverandørfaktura)"),
+      kind: z.enum(["cash_purchase", "supplier"]).describe("Type: 'cash_purchase' (kontantkjøp/betalt) eller 'supplier' (leverandørfaktura/ubetalt)"),
       paid: z.boolean().describe("Er kjøpet betalt? (true for cash_purchase, false for supplier)"),
       currency: z.string().default("NOK").describe("Valuta (standard: NOK)"),
       lines: z.array(z.object({
@@ -824,12 +837,44 @@ export function createFikenTools(client: FikenClient, companySlug: string, pendi
       supplierId: z.number().optional().describe("Leverandør-ID (søk med searchContacts supplier=true)"),
       identifier: z.string().optional().describe("Fakturanummer fra leverandør"),
       dueDate: z.string().optional().describe("Forfallsdato (YYYY-MM-DD) - påkrevd for supplier"),
-      paymentAccount: z.string().optional().describe("Bankkonto for betaling - påkrevd for cash_purchase"),
+      paymentAccount: z.string().optional().describe("Bankkonto for betaling (f.eks. '1920:10001'). Hvis ikke oppgitt for cash_purchase, velges automatisk eller du får valg."),
       paymentDate: z.string().optional().describe("Betalingsdato hvis betalt"),
       projectId: z.number().optional().describe("Prosjekt-ID for kostnadsføring"),
     }),
     execute: async ({ date, kind, paid, currency, lines, supplierId, identifier, dueDate, paymentAccount, paymentDate, projectId }) => {
       try {
+        // SMART BANKKONTO-LOGIKK for kontantkjøp
+        let effectivePaymentAccount = paymentAccount;
+        
+        if (kind === "cash_purchase" && !paymentAccount) {
+          // Hent bankkontoer automatisk
+          const bankAccounts = await client.getBankAccounts();
+          const activeBankAccounts = bankAccounts.filter(a => !a.inactive);
+          
+          if (activeBankAccounts.length === 0) {
+            return {
+              success: false,
+              error: "Ingen aktive bankkontoer funnet. Opprett en bankkonto først, eller oppgi paymentAccount manuelt.",
+            };
+          } else if (activeBankAccounts.length === 1) {
+            // Kun én bankkonto - bruk den automatisk
+            effectivePaymentAccount = activeBankAccounts[0].accountCode;
+          } else {
+            // Flere bankkontoer - returner liste så AI kan spørre bruker
+            return {
+              success: false,
+              requiresSelection: true,
+              selectionType: "bankAccount",
+              options: activeBankAccounts.map(a => ({
+                accountCode: a.accountCode,
+                name: a.name,
+                bankAccountNumber: a.bankAccountNumber,
+              })),
+              message: `Flere bankkontoer funnet (${activeBankAccounts.length} stk). Spør bruker hvilken som ble brukt for denne betalingen, og kall createPurchase igjen med paymentAccount satt til 'accountCode'-verdien fra valgt konto.`,
+            };
+          }
+        }
+        
         // Calculate VAT for each line based on vatType
         const vatRates: Record<string, number> = {
           "HIGH": 0.25,
@@ -864,9 +909,9 @@ export function createFikenTools(client: FikenClient, companySlug: string, pendi
           lines: linesWithVat,
           supplierId,
           dueDate,
-          paymentAccount,
+          paymentAccount: effectivePaymentAccount,
           // If paid with paymentAccount but no paymentDate, use the purchase date
-          paymentDate: paymentDate || (paid && paymentAccount ? date : undefined),
+          paymentDate: paymentDate || (paid && effectivePaymentAccount ? date : undefined),
           kid: identifier,
           projectId,
         };
@@ -885,6 +930,7 @@ export function createFikenTools(client: FikenClient, companySlug: string, pendi
             paid: purchase.paid,
             currency: purchase.currency,
           },
+          paymentAccount: effectivePaymentAccount,
         };
       } catch (error) {
         console.error("createPurchase ERROR:", error);
@@ -2216,6 +2262,125 @@ Verktøyet returnerer:
     },
   });
 
+  const getUnmatchedBankTransactions = tool({
+    description: `Søk etter banktransaksjoner som kan matche en kvittering/utgift.
+Bruk dette FØR du registrerer et kjøp for å finne matchende banktransaksjon.
+
+Søker etter transaksjoner på bankkontoer (1920-serien) innenfor dato-range og beløps-margin.
+Returnerer transaksjoner som kan være samme betaling som kvitteringen.`,
+    parameters: z.object({
+      amount: z.number().describe("Beløp fra kvittering i KR (ikke øre). F.eks. 450 for 450 kr."),
+      date: z.string().describe("Dato fra kvittering (YYYY-MM-DD)"),
+      daysRange: z.number().optional().default(5).describe("Antall dager før/etter å søke (standard: 5)"),
+    }),
+    execute: async ({ amount, date, daysRange = 5 }) => {
+      try {
+        // 1. Beregn dato-range
+        const targetDate = new Date(date);
+        const dateFrom = new Date(targetDate);
+        dateFrom.setDate(dateFrom.getDate() - daysRange);
+        const dateTo = new Date(targetDate);
+        dateTo.setDate(dateTo.getDate() + daysRange);
+        
+        const dateFromStr = dateFrom.toISOString().split("T")[0];
+        const dateToStr = dateTo.toISOString().split("T")[0];
+        
+        // 2. Hent bankkontoer
+        const bankAccounts = await client.getBankAccounts();
+        const activeBankAccounts = bankAccounts.filter(a => !a.inactive);
+        
+        if (activeBankAccounts.length === 0) {
+          return {
+            success: false,
+            error: "Ingen aktive bankkontoer funnet i Fiken.",
+          };
+        }
+        
+        // 3. Hent journal entries (bilag) i perioden
+        const journalEntries = await client.getJournalEntries({
+          dateGe: dateFromStr,
+          dateLe: dateToStr,
+          pageSize: 100,
+        });
+        
+        // 4. Konverter beløp til øre og finn margin (5 kr = 500 øre)
+        const amountInOre = amount * 100;
+        const marginInOre = 500; // 5 kr margin
+        
+        // 5. Filtrer på entries som har bankkonto og matcher beløpet
+        // I Fiken er bankkonto typisk "1920:XXXXX" format
+        const matches: Array<{
+          journalEntryId: number;
+          transactionId?: number;
+          date: string;
+          amount: number;
+          amountKr: number;
+          description: string;
+          bankAccount: string;
+        }> = [];
+        
+        for (const entry of journalEntries) {
+          if (!entry.lines || !entry.journalEntryId) continue;
+          
+          for (const line of entry.lines) {
+            // Sjekk om linjen er på en bankkonto (starter med 19)
+            const account = line.debitAccount || line.creditAccount;
+            if (!account || !account.startsWith("19")) continue;
+            
+            // Hent beløp (negativt for kredit/uttak, positivt for debet/innskudd)
+            // For utgifter leter vi etter kredit (penger ut av bank)
+            const lineAmount = line.amount || 0;
+            
+            // Sjekk om beløpet matcher (vi leter etter negative beløp = uttak)
+            // Eller sammenlign absolutt verdi
+            const absAmount = Math.abs(lineAmount);
+            if (Math.abs(absAmount - amountInOre) <= marginInOre) {
+              matches.push({
+                journalEntryId: entry.journalEntryId,
+                transactionId: entry.transactionId,
+                date: entry.date || date,
+                amount: lineAmount,
+                amountKr: lineAmount / 100,
+                description: entry.description || "Ingen beskrivelse",
+                bankAccount: account,
+              });
+            }
+          }
+        }
+        
+        return {
+          success: true,
+          matchCount: matches.length,
+          matches,
+          searchCriteria: {
+            amount,
+            amountInOre,
+            targetDate: date,
+            dateFrom: dateFromStr,
+            dateTo: dateToStr,
+            marginKr: 5,
+          },
+          bankAccounts: activeBankAccounts.map(a => ({
+            id: a.bankAccountId,
+            name: a.name,
+            accountCode: a.accountCode,
+            bankAccountNumber: a.bankAccountNumber,
+          })),
+          hint: matches.length === 0
+            ? "Ingen matchende banktransaksjoner funnet. Spør bruker om utgiften er betalt eller ubetalt."
+            : matches.length === 1
+              ? "Én match funnet. Spør bruker om dette er samme kjøp."
+              : `${matches.length} potensielle matcher funnet. Vis liste og la bruker velge.`,
+        };
+      } catch (error) {
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : "Kunne ikke søke etter banktransaksjoner",
+        };
+      }
+    },
+  });
+
   // ============================================
   // PROJECT TOOLS
   // ============================================
@@ -3151,6 +3316,7 @@ Verktøyet returnerer:
     getBankAccounts,
     getBankBalances,
     createBankAccount,
+    getUnmatchedBankTransactions,
     
     // Projects
     searchProjects,
