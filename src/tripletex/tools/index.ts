@@ -1755,26 +1755,277 @@ Returnerer kundeliste med kontaktinfo.`,
       },
     }),
 
-    create_customer: tool({
-      description: `Opprett en ny kunde i Tripletex.`,
+    // ==================== BRØNNØYSUND OPPSLAG ====================
+
+    lookup_company_brreg: tool({
+      description: `Slå opp bedriftsinformasjon fra Brønnøysundregistrene.
+      
+BRUK DETTE FØR du oppretter bedriftskunde! Gir deg:
+- Offisielt firmanavn
+- Adresse (gate, postnummer, poststed)  
+- E-post (hvis registrert i Brreg)
+- Telefon (hvis registrert)
+- Om de er MVA-registrert
+- Organisasjonsform (AS, ENK, ANS, etc.)
+
+Du kan søke på org.nr (anbefalt) eller firmanavn.`,
       parameters: z.object({
-        name: z.string().describe("Kundenavn"),
-        organizationNumber: z.string().optional().describe("Organisasjonsnummer"),
-        email: z.string().optional().describe("E-postadresse"),
-        invoiceEmail: z.string().optional().describe("Faktura-e-post"),
+        organizationNumber: z.string().optional().describe("9-sifret organisasjonsnummer (anbefalt)"),
+        companyName: z.string().optional().describe("Firmanavn å søke etter (hvis du ikke har org.nr)"),
+      }),
+      execute: async ({ organizationNumber, companyName }) => {
+        try {
+          // Må ha enten org.nr eller navn
+          if (!organizationNumber && !companyName) {
+            return {
+              success: false,
+              error: "Du må oppgi enten organisasjonsnummer eller firmanavn",
+            };
+          }
+
+          // Hvis vi har org.nr, slå opp direkte
+          if (organizationNumber) {
+            // Valider at det er 9 siffer
+            const cleanOrgNr = organizationNumber.replace(/\s/g, "");
+            if (!/^\d{9}$/.test(cleanOrgNr)) {
+              return {
+                success: false,
+                error: "Organisasjonsnummer må være 9 siffer",
+                hint: "Fjern eventuelle mellomrom og prøv igjen",
+              };
+            }
+
+            const response = await fetch(
+              `https://data.brreg.no/enhetsregisteret/api/enheter/${cleanOrgNr}`,
+              { headers: { "Accept": "application/json" } }
+            );
+
+            if (response.status === 404) {
+              return {
+                success: false,
+                error: `Fant ingen bedrift med org.nr ${cleanOrgNr}`,
+                hint: "Sjekk at organisasjonsnummeret er korrekt",
+              };
+            }
+
+            if (!response.ok) {
+              return {
+                success: false,
+                error: `Feil ved oppslag i Brønnøysund: ${response.status}`,
+              };
+            }
+
+            const data = await response.json();
+            
+            return {
+              success: true,
+              company: {
+                name: data.navn,
+                organizationNumber: data.organisasjonsnummer,
+                organizationForm: data.organisasjonsform?.beskrivelse || data.organisasjonsform?.kode,
+                address: data.forretningsadresse ? {
+                  addressLine1: data.forretningsadresse.adresse?.[0],
+                  postalCode: data.forretningsadresse.postnummer,
+                  city: data.forretningsadresse.poststed,
+                } : null,
+                email: data.epostadresse || null,
+                phone: data.telefon || data.mobil || null,
+                isVatRegistered: data.registrertIMvaregisteret || false,
+                industry: data.naeringskode1?.beskrivelse || null,
+              },
+              hint: data.epostadresse 
+                ? "Bruk denne informasjonen til å opprette kunde med find_or_create_customer"
+                : "OBS: Ingen e-post registrert i Brønnøysund. Spør brukeren om e-postadresse!",
+            };
+          }
+
+          // Søk på navn
+          if (companyName) {
+            const response = await fetch(
+              `https://data.brreg.no/enhetsregisteret/api/enheter?navn=${encodeURIComponent(companyName)}&size=5`,
+              { headers: { "Accept": "application/json" } }
+            );
+
+            if (!response.ok) {
+              return {
+                success: false,
+                error: `Feil ved søk i Brønnøysund: ${response.status}`,
+              };
+            }
+
+            const data = await response.json();
+            
+            if (!data._embedded?.enheter || data._embedded.enheter.length === 0) {
+              return {
+                success: false,
+                error: `Fant ingen bedrifter med navn "${companyName}"`,
+                hint: "Prøv å søke med organisasjonsnummer i stedet, eller sjekk stavemåten",
+              };
+            }
+
+            const companies = data._embedded.enheter.map((e: any) => ({
+              name: e.navn,
+              organizationNumber: e.organisasjonsnummer,
+              organizationForm: e.organisasjonsform?.beskrivelse || e.organisasjonsform?.kode,
+              address: e.forretningsadresse ? {
+                city: e.forretningsadresse.poststed,
+              } : null,
+            }));
+
+            if (companies.length === 1) {
+              // Bare én treff - slå opp full info
+              const fullLookup = await fetch(
+                `https://data.brreg.no/enhetsregisteret/api/enheter/${companies[0].organizationNumber}`,
+                { headers: { "Accept": "application/json" } }
+              );
+              
+              if (fullLookup.ok) {
+                const fullData = await fullLookup.json();
+                return {
+                  success: true,
+                  company: {
+                    name: fullData.navn,
+                    organizationNumber: fullData.organisasjonsnummer,
+                    organizationForm: fullData.organisasjonsform?.beskrivelse || fullData.organisasjonsform?.kode,
+                    address: fullData.forretningsadresse ? {
+                      addressLine1: fullData.forretningsadresse.adresse?.[0],
+                      postalCode: fullData.forretningsadresse.postnummer,
+                      city: fullData.forretningsadresse.poststed,
+                    } : null,
+                    email: fullData.epostadresse || null,
+                    phone: fullData.telefon || fullData.mobil || null,
+                    isVatRegistered: fullData.registrertIMvaregisteret || false,
+                    industry: fullData.naeringskode1?.beskrivelse || null,
+                  },
+                  hint: fullData.epostadresse 
+                    ? "Bruk denne informasjonen til å opprette kunde med find_or_create_customer"
+                    : "OBS: Ingen e-post registrert i Brønnøysund. Spør brukeren om e-postadresse!",
+                };
+              }
+            }
+
+            return {
+              success: true,
+              searchResults: companies,
+              message: `Fant ${companies.length} bedrift(er) med navn "${companyName}"`,
+              hint: "Velg riktig bedrift og bruk org.nr for å hente full informasjon med lookup_company_brreg",
+            };
+          }
+
+          return {
+            success: false,
+            error: "Kunne ikke utføre oppslag",
+          };
+        } catch (error) {
+          return {
+            success: false,
+            error: error instanceof Error ? error.message : "Ukjent feil ved oppslag i Brønnøysund",
+          };
+        }
+      },
+    }),
+
+    // ==================== CUSTOMER CRUD ====================
+
+    create_customer: tool({
+      description: `Opprett en ny kunde i Tripletex.
+
+⚠️ FOR FAKTURERING: Bruk heller find_or_create_customer som er enklere!
+
+⚠️ VIKTIG:
+- E-post er PÅKREVD for å kunne sende faktura
+- For bedrifter: Bruk lookup_company_brreg først for å hente info
+- isPrivateIndividual MÅ settes (true=privatperson, false=bedrift)`,
+      parameters: z.object({
+        name: z.string().describe("Kundenavn (PÅKREVD)"),
+        email: z.string().describe("E-postadresse (PÅKREVD for fakturering!)"),
+        isPrivateIndividual: z.boolean().describe("true=privatperson, false=bedrift (PÅKREVD)"),
+        organizationNumber: z.string().optional().describe("Org.nr (PÅKREVD for bedrifter)"),
+        invoiceEmail: z.string().optional().describe("Alternativ e-post kun for faktura"),
         phoneNumber: z.string().optional().describe("Telefonnummer"),
-        addressLine1: z.string().optional().describe("Adresselinje 1"),
+        addressLine1: z.string().optional().describe("Gateadresse"),
         postalCode: z.string().optional().describe("Postnummer"),
         city: z.string().optional().describe("Poststed"),
+        invoiceSendMethod: z.enum(["EMAIL", "EHF"]).optional().describe("EHF for bedrifter som støtter det, EMAIL ellers"),
+        skipDuplicateCheck: z.boolean().optional().describe("Hopp over duplikat-sjekk"),
       }),
       execute: async (params) => {
         try {
+          // Sjekk for duplikater først (med mindre skipDuplicateCheck er true)
+          if (!params.skipDuplicateCheck) {
+            // Sjekk på organisasjonsnummer hvis oppgitt
+            if (params.organizationNumber) {
+              const existingByOrg = await client.getCustomers({ 
+                organizationNumber: params.organizationNumber 
+              });
+              if (existingByOrg.values.length > 0) {
+                const c = existingByOrg.values[0];
+                return {
+                  success: true,
+                  alreadyExists: true,
+                  message: `Fant eksisterende kunde med org.nr ${params.organizationNumber}`,
+                  customer: {
+                    id: c.id,
+                    name: c.name,
+                    organizationNumber: c.organizationNumber,
+                    customerNumber: c.customerNumber,
+                    email: c.email,
+                  },
+                  hint: "Bruk denne kunde-ID for faktura. Hvis du vil opprette en ny kunde likevel, bruk skipDuplicateCheck=true.",
+                };
+              }
+            }
+            
+            // Sjekk på navn
+            const existingByName = await client.searchCustomerByName(params.name);
+            if (existingByName.length > 0) {
+              // Hvis eksakt match på navn, returner den
+              const exactMatch = existingByName.find(c => 
+                c.name.toLowerCase() === params.name.toLowerCase()
+              );
+              if (exactMatch) {
+                return {
+                  success: true,
+                  alreadyExists: true,
+                  message: `Fant eksisterende kunde med navnet "${params.name}"`,
+                  customer: {
+                    id: exactMatch.id,
+                    name: exactMatch.name,
+                    organizationNumber: exactMatch.organizationNumber,
+                    customerNumber: exactMatch.customerNumber,
+                    email: exactMatch.email,
+                  },
+                  hint: "Bruk denne kunde-ID for faktura. Hvis du vil opprette en ny kunde likevel, bruk skipDuplicateCheck=true.",
+                };
+              }
+              
+              // Lignende navn funnet - vis dem
+              if (existingByName.length <= 5) {
+                return {
+                  success: true,
+                  possibleDuplicates: true,
+                  message: `Fant ${existingByName.length} kunde(r) med lignende navn`,
+                  customers: existingByName.map(c => ({
+                    id: c.id,
+                    name: c.name,
+                    organizationNumber: c.organizationNumber,
+                    customerNumber: c.customerNumber,
+                  })),
+                  hint: "Velg en eksisterende kunde, eller bruk skipDuplicateCheck=true for å opprette ny.",
+                };
+              }
+            }
+          }
+
+          // Opprett ny kunde
           const result = await client.createCustomer({
             name: params.name,
             organizationNumber: params.organizationNumber,
             email: params.email,
-            invoiceEmail: params.invoiceEmail,
+            invoiceEmail: params.invoiceEmail || params.email,
             phoneNumber: params.phoneNumber,
+            isPrivateIndividual: params.isPrivateIndividual,
+            invoiceSendMethod: params.invoiceSendMethod || "EMAIL",
             physicalAddress: (params.addressLine1 || params.postalCode || params.city) ? {
               addressLine1: params.addressLine1,
               postalCode: params.postalCode,
@@ -1786,17 +2037,23 @@ Returnerer kundeliste med kontaktinfo.`,
 
           return {
             success: true,
-            message: `Kunde "${c.name}" opprettet`,
+            created: true,
+            message: `Kunde "${c.name}" opprettet${params.isPrivateIndividual ? " (privatperson)" : " (bedrift)"}`,
             customer: {
               id: c.id,
               name: c.name,
               customerNumber: c.customerNumber,
+              organizationNumber: c.organizationNumber,
+              email: c.email,
+              isPrivateIndividual: c.isPrivateIndividual,
             },
           };
         } catch (error) {
+          const errorMsg = error instanceof Error ? error.message : "Ukjent feil ved opprettelse av kunde";
           return {
             success: false,
-            error: error instanceof Error ? error.message : "Ukjent feil ved opprettelse av kunde",
+            error: errorMsg,
+            hint: getTripletexErrorHint(errorMsg),
           };
         }
       },
@@ -1833,6 +2090,165 @@ Returnerer kundeliste med kontaktinfo.`,
           return {
             success: false,
             error: error instanceof Error ? error.message : "Ukjent feil ved oppdatering av kunde",
+          };
+        }
+      },
+    }),
+
+    find_or_create_customer: tool({
+      description: `Finn eksisterende kunde eller opprett ny automatisk.
+Dette er det ANBEFALTE verktøyet for fakturering!
+
+⚠️ PÅKREVD INFORMASJON:
+- name: Kundenavn
+- email: E-postadresse (PÅKREVD for å sende faktura!)
+- isPrivateIndividual: true=privatperson, false=bedrift
+
+FOR BEDRIFTER (isPrivateIndividual=false):
+- organizationNumber er PÅKREVD
+- Bruk lookup_company_brreg FØRST for å hente info fra Brønnøysund!
+- Spør brukeren om de støtter EHF-faktura
+
+FOR PRIVATPERSONER (isPrivateIndividual=true):
+- Trenger bare navn og e-post
+
+ARBEIDSFLYT:
+1. Søker først etter eksisterende kunde på org.nr (hvis oppgitt)
+2. Hvis ikke funnet, søker på navn
+3. Hvis fortsatt ikke funnet, oppretter ny kunde med all info`,
+      parameters: z.object({
+        name: z.string().describe("Kundenavn (PÅKREVD)"),
+        email: z.string().describe("E-postadresse (PÅKREVD for fakturering!)"),
+        isPrivateIndividual: z.boolean().describe("true=privatperson, false=bedrift (PÅKREVD)"),
+        organizationNumber: z.string().optional().describe("Org.nr (PÅKREVD for bedrifter!)"),
+        phoneNumber: z.string().optional().describe("Telefonnummer"),
+        addressLine1: z.string().optional().describe("Gateadresse"),
+        postalCode: z.string().optional().describe("Postnummer"),
+        city: z.string().optional().describe("Poststed"),
+        invoiceSendMethod: z.enum(["EMAIL", "EHF"]).optional().describe("EHF for bedrifter som støtter det, EMAIL ellers"),
+      }),
+      execute: async ({ name, email, isPrivateIndividual, organizationNumber, phoneNumber, addressLine1, postalCode, city, invoiceSendMethod }) => {
+        try {
+          // 1. Søk på organisasjonsnummer hvis oppgitt
+          if (organizationNumber) {
+            const byOrg = await client.getCustomers({ organizationNumber });
+            if (byOrg.values.length > 0) {
+              const c = byOrg.values[0];
+              // Sjekk om eksisterende kunde mangler e-post
+              const existingEmail = c.email || c.invoiceEmail;
+              return {
+                success: true,
+                action: "found_by_orgnr",
+                message: `Fant eksisterende kunde med org.nr ${organizationNumber}`,
+                customer: {
+                  id: c.id,
+                  name: c.name,
+                  organizationNumber: c.organizationNumber,
+                  customerNumber: c.customerNumber,
+                  email: existingEmail,
+                  isPrivateIndividual: c.isPrivateIndividual,
+                },
+                warning: !existingEmail ? "OBS: Kunden har ingen e-post registrert! Oppdater med update_customer eller bruk overrideEmail ved sending." : undefined,
+              };
+            }
+          }
+          
+          // 2. Søk på navn
+          const byName = await client.searchCustomerByName(name);
+          if (byName.length === 1) {
+            const c = byName[0];
+            const existingEmail = c.email || c.invoiceEmail;
+            return {
+              success: true,
+              action: "found_by_name",
+              message: `Fant eksisterende kunde med navn "${c.name}"`,
+              customer: {
+                id: c.id,
+                name: c.name,
+                organizationNumber: c.organizationNumber,
+                customerNumber: c.customerNumber,
+                email: existingEmail,
+                isPrivateIndividual: c.isPrivateIndividual,
+              },
+              warning: !existingEmail ? "OBS: Kunden har ingen e-post registrert! Oppdater med update_customer eller bruk overrideEmail ved sending." : undefined,
+            };
+          }
+          
+          if (byName.length > 1) {
+            // Sjekk for eksakt match
+            const exactMatch = byName.find(c => 
+              c.name.toLowerCase() === name.toLowerCase()
+            );
+            if (exactMatch) {
+              const existingEmail = exactMatch.email || exactMatch.invoiceEmail;
+              return {
+                success: true,
+                action: "found_exact_match",
+                message: `Fant eksisterende kunde med eksakt navn "${exactMatch.name}"`,
+                customer: {
+                  id: exactMatch.id,
+                  name: exactMatch.name,
+                  organizationNumber: exactMatch.organizationNumber,
+                  customerNumber: exactMatch.customerNumber,
+                  email: existingEmail,
+                  isPrivateIndividual: exactMatch.isPrivateIndividual,
+                },
+                warning: !existingEmail ? "OBS: Kunden har ingen e-post registrert! Oppdater med update_customer eller bruk overrideEmail ved sending." : undefined,
+              };
+            }
+            
+            // Flere mulige matcher - returner liste så AI kan velge
+            return {
+              success: true,
+              action: "multiple_found",
+              message: `Fant ${byName.length} kunder med lignende navn. Velg riktig kunde eller opprett ny.`,
+              customers: byName.slice(0, 5).map(c => ({
+                id: c.id,
+                name: c.name,
+                organizationNumber: c.organizationNumber,
+                customerNumber: c.customerNumber,
+                email: c.email,
+              })),
+              hint: "Velg kunde-ID fra listen, eller bruk create_customer med skipDuplicateCheck=true for å opprette ny.",
+            };
+          }
+          
+          // 3. Ingen kunde funnet - opprett ny
+          const created = await client.createCustomer({
+            name,
+            organizationNumber,
+            email,
+            invoiceEmail: email,
+            phoneNumber,
+            isPrivateIndividual,
+            invoiceSendMethod: invoiceSendMethod || "EMAIL",
+            physicalAddress: (addressLine1 || postalCode || city) ? {
+              addressLine1,
+              postalCode,
+              city,
+            } : undefined,
+          });
+          
+          const c = created.value;
+          return {
+            success: true,
+            action: "created",
+            message: `Opprettet ny kunde "${c.name}"${isPrivateIndividual ? " (privatperson)" : " (bedrift)"}`,
+            customer: {
+              id: c.id,
+              name: c.name,
+              organizationNumber: c.organizationNumber,
+              customerNumber: c.customerNumber,
+              email: c.email,
+              isPrivateIndividual: c.isPrivateIndividual,
+            },
+          };
+        } catch (error) {
+          const errorMsg = error instanceof Error ? error.message : "Ukjent feil";
+          return {
+            success: false,
+            error: errorMsg,
+            hint: getTripletexErrorHint(errorMsg),
           };
         }
       },
@@ -2179,22 +2595,59 @@ Returnerer fakturaer med beløp, status og forfallsdato.`,
     }),
 
     create_invoice: tool({
-      description: `Opprett en ny utgående faktura.
-MERK: Må først opprette en ordre, deretter fakturere den.`,
+      description: `Opprett en ny utgående faktura til en kunde.
+Standard MVA-sats (25%) brukes automatisk hvis vatTypeId ikke oppgis.
+
+VIKTIG: Bankkonto er IKKE påkrevd! Faktura kan alltid sendes via EMAIL eller EHF.
+
+TIPS:
+- Bruk search_customers eller find_or_create_customer først for å finne/opprette kunde-ID
+- vatTypeId er valgfri - 25% utgående MVA brukes som standard
+- invoiceDate og dueDate må være i format YYYY-MM-DD
+- Etter opprettelse, bruk send_invoice for å sende via EMAIL eller EHF`,
       parameters: z.object({
-        customerId: z.number().describe("Kunde-ID"),
+        customerId: z.number().describe("Kunde-ID fra search_customers eller find_or_create_customer"),
         invoiceDate: z.string().describe("Fakturadato (YYYY-MM-DD)"),
         dueDate: z.string().describe("Forfallsdato (YYYY-MM-DD)"),
         orderLines: z.array(z.object({
           description: z.string().describe("Varebeskrivelse"),
           count: z.number().describe("Antall"),
-          unitPriceExcludingVat: z.number().describe("Enhetspris eks. MVA"),
-          vatTypeId: z.number().optional().describe("MVA-type ID"),
+          unitPriceExcludingVat: z.number().describe("Enhetspris eks. MVA i NOK"),
+          vatTypeId: z.number().optional().describe("MVA-type ID (valgfri - bruker 25% utgående som standard)"),
         })).describe("Fakturalinjer"),
+        invoiceComment: z.string().optional().describe("Kommentar på faktura"),
       }),
-      execute: async ({ customerId, invoiceDate, dueDate, orderLines }) => {
+      execute: async ({ customerId, invoiceDate, dueDate, orderLines, invoiceComment }) => {
         try {
-          // 1. Opprett ordre
+          // 1. Hent standard MVA-type for linjer uten vatTypeId
+          let defaultVatTypeId: number | null = null;
+          const needsDefaultVat = orderLines.some(line => !line.vatTypeId);
+          
+          if (needsDefaultVat) {
+            try {
+              const vatTypesResult = await client.getVatTypes();
+              // Finn 25% utgående MVA (vanligvis kode "3" eller inneholder "utgående")
+              const outputVat25 = vatTypesResult.values.find(v => 
+                v.percentage === 25 && 
+                (v.name?.toLowerCase().includes("utgående") || 
+                 v.name?.toLowerCase().includes("salg") ||
+                 v.number === "3")
+              );
+              if (outputVat25) {
+                defaultVatTypeId = outputVat25.id;
+              } else {
+                // Fallback: Finn enhver 25% MVA-type
+                const anyVat25 = vatTypesResult.values.find(v => v.percentage === 25);
+                if (anyVat25) {
+                  defaultVatTypeId = anyVat25.id;
+                }
+              }
+            } catch {
+              // Fortsett uten default MVA - Tripletex kan ha sin egen default
+            }
+          }
+
+          // 2. Opprett ordre med fakturalinjer
           const orderResult = await client.createOrder({
             customer: { id: customerId },
             orderDate: invoiceDate,
@@ -2203,11 +2656,14 @@ MERK: Må først opprette en ordre, deretter fakturere den.`,
               description: line.description,
               count: line.count,
               unitPriceExcludingVatCurrency: line.unitPriceExcludingVat,
-              vatType: line.vatTypeId ? { id: line.vatTypeId } : undefined,
+              vatType: line.vatTypeId 
+                ? { id: line.vatTypeId } 
+                : (defaultVatTypeId ? { id: defaultVatTypeId } : undefined),
             })),
+            invoiceComment: invoiceComment,
           });
 
-          // 2. Opprett faktura fra ordre
+          // 3. Opprett faktura fra ordre
           const invoiceResult = await client.createInvoice({
             invoiceDate,
             invoiceDueDate: dueDate,
@@ -2217,41 +2673,103 @@ MERK: Må først opprette en ordre, deretter fakturere den.`,
 
           return {
             success: true,
-            message: `Faktura ${inv.invoiceNumber} opprettet`,
+            message: `Faktura ${inv.invoiceNumber || inv.id} opprettet for kunde`,
             invoice: {
               id: inv.id,
               invoiceNumber: inv.invoiceNumber,
               invoiceDate: inv.invoiceDate,
+              dueDate: inv.invoiceDueDate,
               amount: inv.amount,
+              amountExcludingVat: inv.amountExcludingVat,
             },
+            nextStep: "Bruk send_invoice for å sende fakturaen til kunden via EMAIL eller EHF.",
           };
         } catch (error) {
+          const errorMsg = error instanceof Error ? error.message : "Ukjent feil ved opprettelse av faktura";
           return {
             success: false,
-            error: error instanceof Error ? error.message : "Ukjent feil ved opprettelse av faktura",
+            error: errorMsg,
+            hint: getTripletexErrorHint(errorMsg),
           };
         }
       },
     }),
 
     send_invoice: tool({
-      description: `Send en faktura til kunden via e-post.`,
+      description: `Send en faktura til kunden.
+
+Sendemetoder:
+- EMAIL: Send som PDF til kundens e-post (STANDARD)
+- EHF: Send elektronisk faktura via EHF (kun for bedrifter som støtter EHF)
+
+⚠️ VIKTIG: Kunden MÅ ha e-postadresse for EMAIL-sending!
+Hvis kunden mangler e-post, bruk overrideEmail parameter.
+
+Hvis du ikke vet om kunden støtter EHF, bruk EMAIL.`,
       parameters: z.object({
-        invoiceId: z.number().describe("Faktura-ID"),
-        sendType: z.enum(["EMAIL", "EHF"]).optional().describe("Sendemetode (EMAIL eller EHF)"),
+        invoiceId: z.number().describe("Faktura-ID fra create_invoice"),
+        sendType: z.enum(["EMAIL", "EHF"]).optional().describe("EMAIL (standard) eller EHF (for bedrifter)"),
+        overrideEmail: z.string().optional().describe("Alternativ e-postadresse (PÅKREVD hvis kunden mangler e-post!)"),
       }),
-      execute: async ({ invoiceId, sendType }) => {
+      execute: async ({ invoiceId, sendType, overrideEmail }) => {
         try {
-          await client.sendInvoice(invoiceId, sendType || "EMAIL");
+          const effectiveSendType = sendType || "EMAIL";
+          
+          // For EMAIL: Sjekk at vi har en e-post å sende til
+          if (effectiveSendType === "EMAIL" && !overrideEmail) {
+            // Hent fakturaen for å få kunde-ID
+            const invoiceResult = await client.getInvoices({ id: String(invoiceId) });
+            if (invoiceResult.values.length > 0) {
+              const invoice = invoiceResult.values[0];
+              // Sjekk om fakturaen har ordre med kunde
+              if (invoice.orders && invoice.orders.length > 0 && invoice.orders[0].customer) {
+                const customerId = invoice.orders[0].customer.id;
+                const customerResult = await client.getCustomer(customerId);
+                const customer = customerResult.value;
+                
+                if (!customer.email && !customer.invoiceEmail) {
+                  return {
+                    success: false,
+                    error: `Kunden "${customer.name}" har ingen e-postadresse registrert!`,
+                    hint: "Bruk overrideEmail parameter for å oppgi e-post, f.eks: send_invoice(invoiceId, sendType='EMAIL', overrideEmail='kunde@example.com')",
+                    suggestion: "Alternativt: Oppdater kunden med update_customer for å legge til e-post permanent.",
+                  };
+                }
+              }
+            }
+          }
+          
+          await client.sendInvoice(invoiceId, effectiveSendType, overrideEmail);
+
+          const sendMethodDesc = {
+            "EMAIL": "e-post",
+            "EHF": "EHF (elektronisk faktura)",
+          };
 
           return {
             success: true,
-            message: `Faktura ${invoiceId} sendt via ${sendType || "EMAIL"}`,
+            message: `Faktura ${invoiceId} sendt via ${sendMethodDesc[effectiveSendType]}${overrideEmail ? ` til ${overrideEmail}` : ""}`,
+            sendMethod: effectiveSendType,
           };
         } catch (error) {
+          const errorMsg = error instanceof Error ? error.message : "Ukjent feil ved sending av faktura";
+          
+          // Sjekk om det er EHF-feil og foreslå EMAIL som alternativ
+          const lowerError = errorMsg.toLowerCase();
+          let hint = getTripletexErrorHint(errorMsg);
+          
+          if (lowerError.includes("ehf") || lowerError.includes("peppol") || lowerError.includes("electronic")) {
+            hint = "Kunden støtter kanskje ikke EHF. Prøv å sende via EMAIL i stedet.";
+          }
+          if (lowerError.includes("email") || lowerError.includes("e-post")) {
+            hint = "Sjekk at kunden har gyldig e-postadresse, eller bruk overrideEmail parameter.";
+          }
+          
           return {
             success: false,
-            error: error instanceof Error ? error.message : "Ukjent feil ved sending av faktura",
+            error: errorMsg,
+            hint: hint,
+            suggestion: sendType === "EHF" ? "Prøv å sende via EMAIL i stedet." : undefined,
           };
         }
       },
@@ -2855,6 +3373,7 @@ VIKTIG: Kall dette verktøyet UMIDDELBART etter at et bilag er opprettet!`,
 
           return {
             success: true,
+            fileUploaded: true,
             message: `${uploadedFiles.length} fil(er) lastet opp til bilag ${voucherId}`,
             uploadedFiles,
             errors: errors.length > 0 ? errors : undefined,
@@ -2877,4 +3396,28 @@ function getMonthName(month: number): string {
     "juli", "august", "september", "oktober", "november", "desember"
   ];
   return months[month - 1] || `måned ${month}`;
+}
+
+/**
+ * Parse Tripletex error messages and provide helpful hints
+ */
+function getTripletexErrorHint(errorMsg: string): string | undefined {
+  const lowerError = errorMsg.toLowerCase();
+  
+  if (lowerError.includes("bankaccount") || lowerError.includes("bankkonto") || lowerError.includes("bank account")) {
+    return "Bankkonto er IKKE påkrevd for å opprette eller sende faktura. Bruk send_invoice med sendType='EMAIL' eller 'EHF'.";
+  }
+  if (lowerError.includes("customer") || lowerError.includes("kunde")) {
+    return "Bruk search_customers eller find_or_create_customer for å finne/opprette kunde først.";
+  }
+  if (lowerError.includes("vat") || lowerError.includes("mva") || lowerError.includes("vattype")) {
+    return "MVA-type ID er påkrevd. Bruk get_vat_types for å se tilgjengelige MVA-typer, eller la feltet stå tomt for automatisk 25% utgående MVA.";
+  }
+  if (lowerError.includes("order")) {
+    return "Ordre må opprettes før faktura. create_invoice håndterer dette automatisk.";
+  }
+  if (lowerError.includes("already exists") || lowerError.includes("duplicate") || lowerError.includes("finnes allerede")) {
+    return "Det finnes allerede en kunde/leverandør med samme informasjon. Bruk search_customers for å finne eksisterende.";
+  }
+  return undefined;
 }

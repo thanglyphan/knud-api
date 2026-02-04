@@ -78,6 +78,7 @@ app.use("/api/stripe", stripeRoutes);
 app.use("/api/chats", chatRoutes);
 
 // Financial summary endpoint (requires auth + accounting connection)
+// Note: Only supported for Fiken. Tripletex returns null (not implemented).
 app.get("/api/financial-summary", requireAuth, requireAccountingConnection, async (req, res) => {
   try {
     const provider = req.accountingProvider;
@@ -94,35 +95,8 @@ app.get("/api/financial-summary", requireAuth, requireAccountingConnection, asyn
       const summary = await fikenClient.getFinancialSummary(fromDate, toDate);
       res.json(summary);
     } else if (provider === "tripletex") {
-      // Tripletex financial summary - show payroll summary for current month
-      const tripletexClient = createTripletexClient(req.accountingAccessToken!, req.companyId!);
-      
-      const now = new Date();
-      const year = now.getFullYear();
-      const month = now.getMonth() + 1; // JavaScript months are 0-indexed
-      
-      try {
-        const payrollSummary = await tripletexClient.getPayrollSummary(year, month);
-        res.json({
-          provider: "tripletex",
-          period: `${year}-${String(month).padStart(2, '0')}`,
-          payroll: {
-            grossSalary: payrollSummary.totals.grossSalary,
-            taxDeduction: payrollSummary.totals.taxDeduction,
-            payrollTax: payrollSummary.totals.payrollTax,
-            netPaid: payrollSummary.totals.netPaid,
-            employeeCount: payrollSummary.employees.length,
-          },
-        });
-      } catch {
-        // If no payroll data, return empty summary
-        res.json({
-          provider: "tripletex",
-          period: `${year}-${String(month).padStart(2, '0')}`,
-          payroll: null,
-          message: "Ingen lønnsdata for denne perioden",
-        });
-      }
+      // Tripletex: Financial summary not implemented - return null
+      res.json(null);
     } else {
       res.status(400).json({ error: "Ukjent regnskapssystem" });
     }

@@ -1060,6 +1060,86 @@ export class TripletexClient {
   // ==================== HELPER METHODS ====================
 
   /**
+   * Get financial summary (income, expenses, result) for a period
+   * - Income: From ledger postings on accounts 3000-3999 (revenue accounts)
+   * - Expenses: From ledger postings on accounts 4000-7999 (cost accounts)
+   * 
+   * Uses postings instead of invoices for more accurate accounting data.
+   * Returns amounts in øre (cents) to match Fiken format.
+   */
+  async getFinancialSummary(fromDate: string, toDate: string): Promise<{
+    period: { from: string; to: string };
+    income: number;
+    expenses: number;
+    result: number;
+  }> {
+    // Hent alle posteringer for perioden
+    let allPostings: Posting[] = [];
+    let postingOffset = 0;
+    const pageSize = 1000;
+    let hasMorePostings = true;
+
+    while (hasMorePostings) {
+      const postings = await this.getPostings({
+        dateFrom: fromDate,
+        dateTo: toDate,
+        from: postingOffset,
+        count: pageSize,
+      });
+      
+      allPostings = allPostings.concat(postings.values);
+      
+      if (postings.values.length < pageSize) {
+        hasMorePostings = false;
+      } else {
+        postingOffset += pageSize;
+        if (postingOffset > 50000) hasMorePostings = false;
+      }
+    }
+
+    let income = 0;
+    let expenses = 0;
+
+    for (const posting of allPostings) {
+      const accountNumber = posting.account?.number || 0;
+      // Sikrer mot NaN/Infinity ved å bruke Number.isFinite
+      const rawAmount = posting.amount ?? 0;
+      const amount = Number.isFinite(rawAmount) ? rawAmount : 0;
+
+      // Norwegian standard chart of accounts (NS 4102):
+      // 3000-3999: Revenue/income (credit = negative amounts in Tripletex)
+      // Income is typically posted as negative (credit), so we negate it
+      if (accountNumber >= 3000 && accountNumber < 4000) {
+        income += Math.abs(amount);
+      }
+      // 4000-7999: Costs/expenses (debit = positive amounts)
+      else if (accountNumber >= 4000 && accountNumber < 8000) {
+        expenses += Math.abs(amount);
+      }
+    }
+
+    // Convert to øre (multiply by 100) to match Fiken format
+    // Final safety check to ensure no NaN values are returned
+    const safeIncome = Number.isFinite(income) ? income : 0;
+    const safeExpenses = Number.isFinite(expenses) ? expenses : 0;
+    const safeResult = safeIncome - safeExpenses;
+
+    console.log('[Tripletex] Financial summary calculated:', {
+      postingCount: allPostings.length,
+      income: safeIncome,
+      expenses: safeExpenses,
+      result: safeResult,
+    });
+
+    return {
+      period: { from: fromDate, to: toDate },
+      income: Math.round(safeIncome * 100),
+      expenses: Math.round(safeExpenses * 100),
+      result: Math.round(safeResult * 100),
+    };
+  }
+
+  /**
    * Get a summary of payroll for a specific month
    * Fetches all payslips for the period and calculates totals
    */
