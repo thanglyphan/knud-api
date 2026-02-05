@@ -26,6 +26,9 @@ model User {
   // Aktivt regnskapssystem
   activeProvider String? // "fiken" | "tripletex"
 
+  // Vilkår og personvern
+  acceptedTermsAt DateTime? // Når brukeren godtok vilkårene
+
   // Relasjoner
   accountingConnections AccountingConnection[]
   chats                 Chat[]

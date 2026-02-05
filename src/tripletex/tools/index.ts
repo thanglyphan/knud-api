@@ -11,6 +11,7 @@ import type { TripletexClient } from "../client.js";
 import { createAccountExpert } from "../subagents/accountExpert.js";
 import { createVatExpert } from "../subagents/vatExpert.js";
 import { createContactMatcher } from "../subagents/contactMatcher.js";
+import { createAccountingExpertTool } from "../../shared/accountingExpertTool.js";
 
 /**
  * Create Tripletex tools for the AI agent
@@ -1443,6 +1444,36 @@ Bruk dette for komplekse MVA-spørsmål som:
         }
       },
     }),
+
+    // ==================== ACCOUNTING EXPERT ====================
+
+    askAccountingExpert: createAccountingExpertTool(
+      "tripletex",
+      async (description, accountType) => {
+        try {
+          const accountExpert = createAccountExpert(client, parseInt(companyId));
+          const result = await accountExpert.suggestAccounts(
+            description, 
+            accountType as "expense" | "income" | "asset" | "liability"
+          );
+          return {
+            success: true,
+            suggestions: result.suggestions.map(s => ({
+              number: s.number,
+              name: s.name,
+              reason: s.reason,
+              vatDeductible: s.vatDeductible,
+              vatNote: s.vatNote,
+            })),
+          };
+        } catch (error) {
+          return {
+            success: false,
+            error: error instanceof Error ? error.message : "Kunne ikke hente kontoforslag",
+          };
+        }
+      }
+    ),
 
     // ==================== VOUCHERS (Bilag) ====================
 

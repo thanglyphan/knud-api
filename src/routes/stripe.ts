@@ -198,6 +198,94 @@ router.post("/init-checkout", async (req: Request, res: Response) => {
 });
 
 /**
+ * POST /api/stripe/validate-promo-code
+ * Validate a promotion code and return discount info
+ */
+router.post("/validate-promo-code", async (req: Request, res: Response) => {
+  const { code } = req.body;
+
+  if (!code) {
+    res.status(400).json({ error: "Promotion code is required" });
+    return;
+  }
+
+  try {
+    // Search for active promotion codes matching the code
+    const promotionCodes = await stripe.promotionCodes.list({
+      code: code.toUpperCase(),
+      active: true,
+      limit: 1,
+    });
+
+    if (promotionCodes.data.length === 0) {
+      res.json({ 
+        valid: false, 
+        error: "Ugyldig eller utløpt rabattkode" 
+      });
+      return;
+    }
+
+    const promoCode = promotionCodes.data[0];
+    
+    // Fetch the coupon separately to get full details
+    // The coupon ID can be in different places depending on SDK version
+    const promoCodeAny = promoCode as any;
+    let couponId: string;
+    
+    if (promoCodeAny.coupon) {
+      // Direct coupon property
+      couponId = typeof promoCodeAny.coupon === "string" 
+        ? promoCodeAny.coupon 
+        : promoCodeAny.coupon.id;
+    } else if (promoCodeAny.promotion?.coupon) {
+      // Nested under promotion
+      couponId = promoCodeAny.promotion.coupon;
+    } else {
+      throw new Error("Could not find coupon ID in promotion code");
+    }
+    
+    const coupon = await stripe.coupons.retrieve(couponId);
+
+    // Build discount info in format frontend expects
+    const discount: {
+      type: "percent_off" | "amount_off";
+      value: number;
+      currency?: string;
+      duration: string;
+      durationInMonths?: number;
+      name?: string;
+    } = coupon.amount_off
+      ? {
+          type: "amount_off",
+          value: coupon.amount_off,
+          currency: coupon.currency || "nok",
+          duration: coupon.duration,
+          durationInMonths: coupon.duration_in_months || undefined,
+          name: coupon.name || undefined,
+        }
+      : {
+          type: "percent_off",
+          value: coupon.percent_off || 0,
+          duration: coupon.duration,
+          durationInMonths: coupon.duration_in_months || undefined,
+          name: coupon.name || undefined,
+        };
+
+    res.json({
+      valid: true,
+      promotionCodeId: promoCode.id,
+      discount,
+    });
+  } catch (error) {
+    console.error("Error validating promo code:", error);
+    res.status(500).json({ 
+      valid: false, 
+      error: "Kunne ikke validere rabattkode" 
+    });
+  }
+});
+
+/**
  * POST /api/stripe/complete-subscription
  * Complete subscription after payment method is saved
  * Creates subscription with trial period (if applicable) and automatic tax
@@ -210,7 +298,7 @@ router.post("/complete-subscription", async (req: Request, res: Response) => {
   }
 
   const userId = authHeader.split(" ")[1];
-  const { priceId, setupIntentId } = req.body;
+  const { priceId, setupIntentId, promotionCode } = req.body;
 
   if (!priceId || !setupIntentId) {
     res.status(400).json({ error: "Price ID and Setup Intent ID are required" });
@@ -279,6 +367,7 @@ router.post("/complete-subscription", async (req: Request, res: Response) => {
       default_payment_method: paymentMethodId,
       automatic_tax: { enabled: true },
       ...(trialEnd && { trial_end: trialEnd }),
+      ...(promotionCode && { discounts: [{ promotion_code: promotionCode }] }),
     };
 
     const subscription = await stripe.subscriptions.create(subscriptionParams);
@@ -431,6 +520,180 @@ router.post("/sync-subscription", async (req: Request, res: Response) => {
   } catch (error) {
     console.error("Error syncing subscription:", error);
     res.status(500).json({ error: "Failed to sync subscription" });
+  }
+});
+
+/**
+ * GET /api/stripe/coupon-status
+ * Check if user has used the FIKEN99 coupon
+ */
+router.get("/coupon-status", async (req: Request, res: Response) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    res.status(401).json({ error: "Not authenticated" });
+    return;
+  }
+
+  const userId = authHeader.split(" ")[1];
+
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+    });
+
+    if (!user) {
+      res.status(404).json({ error: "User not found" });
+      return;
+    }
+
+    // If user has no Stripe customer, they haven't used any coupon
+    if (!user.stripeCustomerId) {
+      res.json({ hasUsedFiken99: false });
+      return;
+    }
+
+    // Fetch all subscriptions for this customer (including canceled)
+    const subscriptions = await stripe.subscriptions.list({
+      customer: user.stripeCustomerId,
+      status: "all",
+      expand: ["data.discount.coupon", "data.discount.promotion_code"],
+    });
+
+    // Check if any subscription has/had the FIKEN99 coupon
+    // Use 'as any' because Stripe SDK types don't include discount properly
+    const hasUsedFiken99 = subscriptions.data.some((sub) => {
+      const discount = (sub as any).discount;
+      if (!discount) return false;
+
+      // Check coupon ID or name
+      const coupon = discount.coupon;
+      if (coupon?.id === "FIKEN99" || coupon?.name === "FIKEN99") {
+        return true;
+      }
+
+      // Check promotion code
+      const promoCode = discount.promotion_code;
+      if (promoCode && typeof promoCode === "object") {
+        if (promoCode.code === "FIKEN99") {
+          return true;
+        }
+      }
+
+      return false;
+    });
+
+    res.json({ hasUsedFiken99 });
+  } catch (error) {
+    console.error("Error checking coupon status:", error);
+    res.status(500).json({ error: "Failed to check coupon status" });
+  }
+});
+
+/**
+ * GET /api/stripe/subscription-details
+ * Get the user's active subscription details including actual price and discount
+ */
+router.get("/subscription-details", async (req: Request, res: Response) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    res.status(401).json({ error: "Not authenticated" });
+    return;
+  }
+
+  const userId = authHeader.split(" ")[1];
+
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+    });
+
+    if (!user) {
+      res.status(404).json({ error: "User not found" });
+      return;
+    }
+
+    // If no Stripe customer, return null subscription
+    if (!user.stripeCustomerId) {
+      res.json({ subscription: null });
+      return;
+    }
+
+    // Fetch active or trialing subscription
+    // Note: Stripe uses "discounts" (array) not "discount" (singular)
+    const subscriptions = await stripe.subscriptions.list({
+      customer: user.stripeCustomerId,
+      status: "all",
+      limit: 1,
+      expand: ["data.items.data.price", "data.discounts"],
+    });
+
+    // Find active or trialing subscription
+    const activeSubscription = subscriptions.data.find(
+      (sub) => sub.status === "active" || sub.status === "trialing"
+    ) || subscriptions.data[0];
+
+    if (!activeSubscription) {
+      res.json({ subscription: null });
+      return;
+    }
+
+    // Get price info from subscription item
+    const subscriptionItem = activeSubscription.items.data[0];
+    const price = subscriptionItem?.price;
+    
+    // Get discount info if any (discounts is an array in Stripe API)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const discounts = (activeSubscription as any).discounts as any[];
+    const discount = discounts && discounts.length > 0 ? discounts[0] : null;
+    let discountInfo = null;
+    
+    if (discount) {
+      // Get coupon ID from discount.source.coupon (newer format) or discount.coupon
+      const couponId = discount.source?.coupon || discount.coupon?.id || discount.coupon;
+      if (couponId) {
+        // Fetch full coupon details
+        const coupon = await stripe.coupons.retrieve(couponId);
+        discountInfo = {
+          name: coupon.name || coupon.id,
+          amountOff: coupon.amount_off,
+          percentOff: coupon.percent_off,
+          currency: coupon.currency,
+          duration: coupon.duration,
+        };
+      }
+    }
+
+    // Calculate actual price after discount
+    const unitAmount = price?.unit_amount || 0;
+    let discountedAmount = unitAmount;
+    
+    if (discountInfo) {
+      if (discountInfo.amountOff) {
+        discountedAmount = Math.max(0, unitAmount - discountInfo.amountOff);
+      } else if (discountInfo.percentOff) {
+        discountedAmount = Math.round(unitAmount * (1 - discountInfo.percentOff / 100));
+      }
+    }
+
+    res.json({
+      subscription: {
+        id: activeSubscription.id,
+        status: activeSubscription.status,
+        currentPeriodEnd: (activeSubscription as any).current_period_end,
+        cancelAtPeriodEnd: activeSubscription.cancel_at_period_end,
+        price: {
+          unitAmount: unitAmount,
+          discountedAmount: discountedAmount,
+          currency: price?.currency || "nok",
+          interval: price?.recurring?.interval || "month",
+          intervalCount: price?.recurring?.interval_count || 1,
+        },
+        discount: discountInfo,
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching subscription details:", error);
+    res.status(500).json({ error: "Failed to fetch subscription details" });
   }
 });
 

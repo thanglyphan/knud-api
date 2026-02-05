@@ -17,6 +17,7 @@ import { z } from "zod";
 import { tool } from "ai";
 import { type FikenClient } from "../client.js";
 import { createAccountHelper } from "./accountHelper.js";
+import { createAccountingExpertTool } from "../../shared/accountingExpertTool.js";
 
 // Type for file attachment passed from chat
 interface PendingFile {
@@ -2163,6 +2164,34 @@ Verktøyet returnerer:
   });
 
   // ============================================
+  // ACCOUNTING EXPERT TOOL
+  // ============================================
+
+  const askAccountingExpert = createAccountingExpertTool(
+    "fiken",
+    async (description, accountType) => {
+      try {
+        const result = await accountHelper.suggestAccounts(description, accountType);
+        return {
+          success: true,
+          suggestions: result.suggestions.map(s => ({
+            code: s.code,
+            name: s.name,
+            reason: s.reason,
+            vatDeductible: s.vatDeductible,
+            vatNote: s.vatNote,
+          })),
+        };
+      } catch (error) {
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : "Kunne ikke hente kontoforslag",
+        };
+      }
+    }
+  );
+
+  // ============================================
   // BANK TOOLS
   // ============================================
 
@@ -3311,6 +3340,7 @@ Returnerer transaksjoner som kan være samme betaling som kvitteringen.`,
     getAccountBalances,
     suggestAccounts,
     getMoreAccountSuggestions,
+    askAccountingExpert,
     
     // Bank
     getBankAccounts,

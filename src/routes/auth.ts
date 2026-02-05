@@ -23,6 +23,11 @@ import {
   getLoggedInUser,
   saveTripletexConnection,
 } from "../tripletex/auth.js";
+import {
+  createOnboardingToken,
+  verifyOnboardingToken,
+  type OnboardingData,
+} from "../utils/onboarding-token.js";
 
 const router = Router();
 
@@ -96,6 +101,10 @@ router.get("/fiken", (_req, res) => {
 /**
  * POST /api/auth/fiken/callback
  * Handles the OAuth2 callback from Fiken
+ * 
+ * For NEW users: Returns an onboardingToken (JWT) containing encrypted OAuth tokens.
+ *                User is NOT created in DB yet - that happens in complete-onboarding.
+ * For EXISTING users: Updates tokens and returns sessionToken as before.
  */
 router.post("/fiken/callback", async (req, res) => {
   try {
@@ -124,34 +133,48 @@ router.post("/fiken/callback", async (req, res) => {
       return;
     }
 
-    // Create or update user in database
-    const user = await prisma.user.upsert({
+    // Check if user already exists
+    const existingUser = await prisma.user.findUnique({
       where: { email: userInfo.email },
-      create: {
+    });
+
+    if (existingUser) {
+      // EXISTING USER: Update tokens and return sessionToken
+      await saveFikenTokens(existingUser.id, tokens);
+      
+      // Update active provider to fiken
+      await prisma.user.update({
+        where: { id: existingUser.id },
+        data: { activeProvider: "fiken" },
+      });
+
+      res.json({
+        success: true,
+        isNewUser: false,
+        user: {
+          id: existingUser.id,
+          email: existingUser.email,
+          name: existingUser.name,
+        },
+        sessionToken: existingUser.id,
+      });
+    } else {
+      // NEW USER: Return onboardingToken, don't create user yet
+      const onboardingToken = createOnboardingToken({
+        provider: "fiken",
+        accessToken: tokens.access_token,
+        refreshToken: tokens.refresh_token,
+        expiresIn: tokens.expires_in,
         email: userInfo.email,
-        name: userInfo.name,
-        activeProvider: "fiken",
-      },
-      update: {
-        name: userInfo.name,
-        activeProvider: "fiken",
-      },
-    });
+        name: userInfo.name || null,
+      });
 
-    // Save Fiken tokens
-    await saveFikenTokens(user.id, tokens);
-
-    // Return user info and session token (using user ID as simple token for now)
-    // In production, you'd want to use JWT or similar
-    res.json({
-      success: true,
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-      },
-      sessionToken: user.id, // Simple session token
-    });
+      res.json({
+        success: true,
+        isNewUser: true,
+        onboardingToken,
+      });
+    }
   } catch (error) {
     console.error("OAuth callback error:", error);
     res.status(500).json({
@@ -171,6 +194,13 @@ router.post("/fiken/callback", async (req, res) => {
  * 1. Go to Tripletex settings
  * 2. Navigate to "Integrasjoner" or "API"
  * 3. Create a new employee token
+ * 
+ * For NEW users: Returns an onboardingToken (JWT) containing encrypted tokens.
+ *                User is NOT created in DB yet - that happens in complete-onboarding.
+ * For EXISTING users: Updates tokens and returns sessionToken as before.
+ * 
+ * Note: Tripletex returns company info directly, but we still use the same onboarding
+ * flow for consistency. The company from Tripletex will be pre-selected in SelectCompany.
  */
 router.post("/tripletex/connect", async (req, res) => {
   // Check if Tripletex is enabled
@@ -200,47 +230,74 @@ router.post("/tripletex/connect", async (req, res) => {
 
     // Get user info from Tripletex
     const userInfo = await getLoggedInUser(session.token);
+    const userName = `${userInfo.employee.firstName} ${userInfo.employee.lastName}`.trim();
 
-    // Create or update user in database
-    const user = await prisma.user.upsert({
+    // Check if user already exists
+    const existingUser = await prisma.user.findUnique({
       where: { email },
-      create: {
+    });
+
+    if (existingUser) {
+      // EXISTING USER: Update tokens and return sessionToken
+      await saveTripletexConnection(
+        existingUser.id,
+        employeeToken,
+        session.token,
+        new Date(session.expirationDate),
+        String(userInfo.companyId),
+        userInfo.company.name,
+        userInfo.company.organizationNumber
+      );
+
+      // Update active provider to tripletex
+      await prisma.user.update({
+        where: { id: existingUser.id },
+        data: { 
+          activeProvider: "tripletex",
+          name: userName,
+        },
+      });
+
+      res.json({
+        success: true,
+        isNewUser: false,
+        user: {
+          id: existingUser.id,
+          email: existingUser.email,
+          name: userName,
+        },
+        company: {
+          id: String(userInfo.companyId),
+          name: userInfo.company.name,
+          organizationNumber: userInfo.company.organizationNumber,
+        },
+        sessionToken: existingUser.id,
+      });
+    } else {
+      // NEW USER: Return onboardingToken, don't create user yet
+      // Note: For Tripletex, we include the session token (not employee token) as accessToken
+      // The refresh token concept doesn't apply the same way, so we store employeeToken there
+      const onboardingToken = createOnboardingToken({
+        provider: "tripletex",
+        accessToken: session.token,
+        refreshToken: employeeToken, // Store employee token for later use
+        expiresIn: Math.floor((new Date(session.expirationDate).getTime() - Date.now()) / 1000),
         email,
-        name: `${userInfo.employee.firstName} ${userInfo.employee.lastName}`.trim(),
-        activeProvider: "tripletex",
-      },
-      update: {
-        name: `${userInfo.employee.firstName} ${userInfo.employee.lastName}`.trim(),
-        activeProvider: "tripletex",
-      },
-    });
+        name: userName,
+      });
 
-    // Save Tripletex connection
-    await saveTripletexConnection(
-      user.id,
-      employeeToken,
-      session.token,
-      new Date(session.expirationDate),
-      String(userInfo.companyId),
-      userInfo.company.name,
-      userInfo.company.organizationNumber
-    );
-
-    // Return user info and session token
-    res.json({
-      success: true,
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-      },
-      company: {
-        id: String(userInfo.companyId),
-        name: userInfo.company.name,
-        organizationNumber: userInfo.company.organizationNumber,
-      },
-      sessionToken: user.id, // Simple session token (same as Fiken)
-    });
+      res.json({
+        success: true,
+        isNewUser: true,
+        onboardingToken,
+        // Include company info since Tripletex provides it directly
+        company: {
+          id: String(userInfo.companyId),
+          name: userInfo.company.name,
+          organizationNumber: userInfo.company.organizationNumber,
+        },
+      });
+    }
   } catch (error) {
     console.error("Tripletex connect error:", error);
     res.status(500).json({
@@ -308,6 +365,7 @@ router.get("/me", async (req, res) => {
         email: user.email,
         name: user.name,
         activeProvider: user.activeProvider,
+        acceptedTermsAt: user.acceptedTermsAt,
         accountingConnected: !!activeConnection,
         accountingTokenValid: hasValidToken,
         // Legacy fields for backward compatibility
@@ -316,7 +374,8 @@ router.get("/me", async (req, res) => {
         ),
         fikenTokenValid:
           user.activeProvider === "fiken" ? hasValidToken : false,
-        company: activeConnection
+        // Only return company if companyId is set (user has completed company selection)
+        company: activeConnection?.companyId
           ? {
               slug: activeConnection.companyId, // For Fiken compatibility
               id: activeConnection.companyId,
@@ -402,9 +461,72 @@ router.post("/logout", async (req, res) => {
 /**
  * GET /api/auth/companies
  * Get list of companies the user has access to
+ * 
+ * Supports two authentication methods:
+ * 1. X-Onboarding-Token: For new users during onboarding (before user is created)
+ * 2. Authorization: Bearer <sessionToken>: For existing users
  */
 router.get("/companies", async (req, res) => {
+  const onboardingToken = req.headers["x-onboarding-token"] as string;
   const authHeader = req.headers.authorization;
+
+  // Try onboarding token first (for new users)
+  if (onboardingToken) {
+    const onboardingData = verifyOnboardingToken(onboardingToken);
+    if (!onboardingData) {
+      res.status(401).json({ error: "Invalid or expired onboarding token" });
+      return;
+    }
+
+    try {
+      if (onboardingData.provider === "fiken") {
+        // Fetch companies from Fiken API using the token from onboarding data
+        const response = await fetch("https://api.fiken.no/api/v2/companies", {
+          headers: {
+            Authorization: `Bearer ${onboardingData.accessToken}`,
+          },
+        });
+
+        if (!response.ok) {
+          throw new Error("Failed to fetch companies from Fiken");
+        }
+
+        const companies = await response.json();
+
+        res.json({
+          provider: "fiken",
+          companies: companies.map((c: any) => ({
+            id: c.slug,
+            slug: c.slug,
+            name: c.name,
+            organizationNumber: c.organizationNumber,
+            hasApiAccess: c.hasApiAccess ?? true,
+          })),
+        });
+      } else if (onboardingData.provider === "tripletex") {
+        // For Tripletex, we need to fetch company info using the session token
+        // The session token is stored as accessToken in onboarding data
+        const userInfo = await getLoggedInUser(onboardingData.accessToken);
+
+        res.json({
+          provider: "tripletex",
+          companies: [{
+            id: String(userInfo.companyId),
+            name: userInfo.company.name,
+            organizationNumber: userInfo.company.organizationNumber,
+          }],
+        });
+      } else {
+        res.status(400).json({ error: "Invalid provider in onboarding token" });
+      }
+    } catch (error) {
+      console.error("Get companies error (onboarding):", error);
+      res.status(500).json({ error: "Failed to get companies" });
+    }
+    return;
+  }
+
+  // Fall back to session token for existing users
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
     res.status(401).json({ error: "Not authenticated" });
     return;
@@ -446,6 +568,7 @@ router.get("/companies", async (req, res) => {
           slug: c.slug, // For backward compatibility
           name: c.name,
           organizationNumber: c.organizationNumber,
+          hasApiAccess: c.hasApiAccess ?? true, // API module enabled in Fiken
         })),
       });
     } else if (provider === "tripletex") {
@@ -488,9 +611,127 @@ router.get("/companies", async (req, res) => {
   }
 });
 
+// ==================== ONBOARDING ====================
+
+/**
+ * POST /api/auth/complete-onboarding
+ * Complete the onboarding process for new users
+ * 
+ * This endpoint is called after a new user has selected their company.
+ * It creates the user in the database and sets up their accounting connection.
+ * 
+ * Requires: X-Onboarding-Token header with valid JWT from fiken/callback or tripletex/connect
+ */
+router.post("/complete-onboarding", async (req, res) => {
+  const onboardingToken = req.headers["x-onboarding-token"] as string;
+  
+  if (!onboardingToken) {
+    res.status(401).json({ error: "Onboarding token is required" });
+    return;
+  }
+
+  const onboardingData = verifyOnboardingToken(onboardingToken);
+  if (!onboardingData) {
+    res.status(401).json({ error: "Invalid or expired onboarding token" });
+    return;
+  }
+
+  const { companyId, companyName, organizationNumber, acceptedTerms } = req.body;
+
+  if (!companyId) {
+    res.status(400).json({ error: "Company ID is required" });
+    return;
+  }
+
+  if (!acceptedTerms) {
+    res.status(400).json({ error: "Must accept terms to create account" });
+    return;
+  }
+
+  try {
+    // Check if user already exists (edge case: user created between callback and onboarding)
+    const existingUser = await prisma.user.findUnique({
+      where: { email: onboardingData.email },
+    });
+
+    if (existingUser) {
+      res.status(409).json({ 
+        error: "User already exists",
+        message: "En bruker med denne e-postadressen finnes allerede. Prøv å logge inn på nytt.",
+      });
+      return;
+    }
+
+    // Create user and accounting connection in a transaction
+    const result = await prisma.$transaction(async (tx) => {
+      // Create user
+      const user = await tx.user.create({
+        data: {
+          email: onboardingData.email,
+          name: onboardingData.name,
+          activeProvider: onboardingData.provider,
+          acceptedTermsAt: new Date(),
+        },
+      });
+
+      // Calculate token expiry
+      const expiresAt = new Date(Date.now() + onboardingData.expiresIn * 1000);
+
+      // Create accounting connection with company info
+      await tx.accountingConnection.create({
+        data: {
+          userId: user.id,
+          provider: onboardingData.provider,
+          accessToken: onboardingData.accessToken,
+          refreshToken: onboardingData.refreshToken,
+          expiresAt,
+          companyId,
+          companyName,
+          organizationNumber,
+        },
+      });
+
+      return user;
+    });
+
+    // Return session token and user info
+    res.json({
+      success: true,
+      sessionToken: result.id,
+      user: {
+        id: result.id,
+        email: result.email,
+        name: result.name,
+        activeProvider: result.activeProvider,
+        acceptedTermsAt: result.acceptedTermsAt,
+        company: {
+          slug: companyId,
+          id: companyId,
+          name: companyName,
+          organizationNumber,
+        },
+        subscription: {
+          status: "none",
+          started: null,
+          ends: null,
+          isActive: false,
+        },
+      },
+    });
+  } catch (error) {
+    console.error("Complete onboarding error:", error);
+    res.status(500).json({
+      error: "Failed to complete onboarding",
+      details: error instanceof Error ? error.message : "Unknown error",
+    });
+  }
+});
+
+// ==================== SELECT COMPANY ====================
+
 /**
  * POST /api/auth/select-company
- * Select which company to use
+ * Select which company to use (for existing users)
  */
 router.post("/select-company", async (req, res) => {
   const authHeader = req.headers.authorization;
@@ -500,7 +741,7 @@ router.post("/select-company", async (req, res) => {
   }
 
   const userId = authHeader.split(" ")[1];
-  const { companySlug, companyId, companyName, organizationNumber, provider } =
+  const { companySlug, companyId, companyName, organizationNumber, provider, acceptedTerms } =
     req.body;
 
   const resolvedCompanyId = companyId || companySlug;
@@ -519,6 +760,7 @@ router.post("/select-company", async (req, res) => {
         .then((u) => u?.activeProvider)) ||
       "fiken";
 
+    // Update company selection
     await prisma.accountingConnection.update({
       where: {
         userId_provider: {
@@ -532,6 +774,14 @@ router.post("/select-company", async (req, res) => {
         organizationNumber,
       },
     });
+
+    // If user accepted terms, update acceptedTermsAt
+    if (acceptedTerms === true) {
+      await prisma.user.update({
+        where: { id: userId },
+        data: { acceptedTermsAt: new Date() },
+      });
+    }
 
     res.json({ success: true });
   } catch (error) {
