@@ -28,6 +28,7 @@ import {
   verifyOnboardingToken,
   type OnboardingData,
 } from "../utils/onboarding-token.js";
+import { encrypt } from "../utils/encryption.js";
 
 const router = Router();
 
@@ -343,11 +344,11 @@ router.post("/tripletex/connect", async (req, res) => {
     } else {
       // NEW USER: Return onboardingToken, don't create user yet
       // Note: For Tripletex, we include the session token (not employee token) as accessToken
-      // The refresh token concept doesn't apply the same way, so we store employeeToken there
+      // Employee token is encrypted before being stored in the JWT payload
       const onboardingToken = createOnboardingToken({
         provider: "tripletex",
         accessToken: session.token,
-        refreshToken: employeeToken, // Store employee token for later use
+        refreshToken: encrypt(employeeToken), // Encrypt employee token in JWT payload
         expiresIn: Math.floor((new Date(session.expirationDate).getTime() - Date.now()) / 1000),
         email,
         name: userName,
@@ -519,6 +520,7 @@ router.post("/logout", async (req, res) => {
       data: { 
         accessToken: "", 
         refreshToken: null,
+        employeeToken: null,
         expiresAt: new Date(0), // Mark as expired
       },
     });
@@ -754,12 +756,16 @@ router.post("/complete-onboarding", async (req, res) => {
       const expiresAt = new Date(Date.now() + onboardingData.expiresIn * 1000);
 
       // Create accounting connection with company info
+      // For Tripletex: refreshToken in onboarding data contains the encrypted employeeToken
+      // Store it in the correct employeeToken column (not refreshToken)
+      const isTripletex = onboardingData.provider === "tripletex";
       await tx.accountingConnection.create({
         data: {
           userId: user.id,
           provider: onboardingData.provider,
           accessToken: onboardingData.accessToken,
-          refreshToken: onboardingData.refreshToken,
+          refreshToken: isTripletex ? null : onboardingData.refreshToken,
+          employeeToken: isTripletex ? onboardingData.refreshToken : undefined, // Already encrypted
           expiresAt,
           companyId,
           companyName,

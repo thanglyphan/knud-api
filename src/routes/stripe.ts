@@ -531,7 +531,7 @@ router.post("/sync-subscription", async (req: Request, res: Response) => {
 
 /**
  * GET /api/stripe/coupon-status
- * Check if user has used the FIKEN99 coupon
+ * Check if user has used the FIKEN99 or TRIPLETEX129 coupons
  */
 router.get("/coupon-status", async (req: Request, res: Response) => {
   const authHeader = req.headers.authorization;
@@ -554,7 +554,7 @@ router.get("/coupon-status", async (req: Request, res: Response) => {
 
     // If user has no Stripe customer, they haven't used any coupon
     if (!user.stripeCustomerId) {
-      res.json({ hasUsedFiken99: false });
+      res.json({ hasUsedFiken99: false, hasUsedTripletex129: false });
       return;
     }
 
@@ -565,30 +565,33 @@ router.get("/coupon-status", async (req: Request, res: Response) => {
       expand: ["data.discount.coupon", "data.discount.promotion_code"],
     });
 
-    // Check if any subscription has/had the FIKEN99 coupon
-    // Use 'as any' because Stripe SDK types don't include discount properly
-    const hasUsedFiken99 = subscriptions.data.some((sub) => {
-      const discount = (sub as any).discount;
-      if (!discount) return false;
+    // Helper to check if a subscription has a specific coupon/promo code
+    const hasUsedCoupon = (couponName: string) =>
+      subscriptions.data.some((sub) => {
+        const discount = (sub as any).discount;
+        if (!discount) return false;
 
-      // Check coupon ID or name
-      const coupon = discount.coupon;
-      if (coupon?.id === "FIKEN99" || coupon?.name === "FIKEN99") {
-        return true;
-      }
-
-      // Check promotion code
-      const promoCode = discount.promotion_code;
-      if (promoCode && typeof promoCode === "object") {
-        if (promoCode.code === "FIKEN99") {
+        // Check coupon ID or name
+        const coupon = discount.coupon;
+        if (coupon?.id === couponName || coupon?.name === couponName) {
           return true;
         }
-      }
 
-      return false;
+        // Check promotion code
+        const promoCode = discount.promotion_code;
+        if (promoCode && typeof promoCode === "object") {
+          if (promoCode.code === couponName) {
+            return true;
+          }
+        }
+
+        return false;
+      });
+
+    res.json({
+      hasUsedFiken99: hasUsedCoupon("FIKEN99"),
+      hasUsedTripletex129: hasUsedCoupon("TRIPLETEX129"),
     });
-
-    res.json({ hasUsedFiken99 });
   } catch (error) {
     console.error("Error checking coupon status:", error);
     res.status(500).json({ error: "Failed to check coupon status" });

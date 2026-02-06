@@ -11,6 +11,7 @@
  */
 
 import { prisma } from "../db.js";
+import { encrypt, decrypt } from "../utils/encryption.js";
 
 const TRIPLETEX_API_URL = process.env.TRIPLETEX_API_URL || "https://tripletex.no/v2";
 
@@ -219,7 +220,8 @@ export async function getValidSessionToken(userId: string): Promise<string | nul
     }
 
     try {
-      const newSession = await createSessionToken(connection.employeeToken);
+      const decryptedEmployeeToken = decrypt(connection.employeeToken);
+      const newSession = await createSessionToken(decryptedEmployeeToken);
 
       // Update session token in database
       await prisma.accountingConnection.update({
@@ -268,7 +270,7 @@ export async function saveTripletexConnection(
       userId,
       provider: "tripletex",
       accessToken: sessionToken,
-      employeeToken: employeeToken,
+      employeeToken: encrypt(employeeToken),
       expiresAt,
       companyId,
       companyName,
@@ -276,7 +278,7 @@ export async function saveTripletexConnection(
     },
     update: {
       accessToken: sessionToken,
-      employeeToken: employeeToken,
+      employeeToken: encrypt(employeeToken),
       expiresAt,
       companyId,
       companyName,
