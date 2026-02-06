@@ -26,6 +26,7 @@ import type {
   CreateEmploymentInput,
   UpdateEmploymentInput,
   CreateEmploymentDetailsInput,
+  Division,
   // Bilag/Voucher types
   Account,
   VatType,
@@ -57,6 +58,17 @@ import type {
   CreateInvoiceInput,
   CreateProductInput,
   UpdateProductInput,
+  // Timesheet types
+  TimesheetEntry,
+  Activity,
+  Project,
+  GetTimesheetEntriesParams,
+  GetActivitiesParams,
+  GetProjectsParams,
+  CreateTimesheetEntryInput,
+  UpdateTimesheetEntryInput,
+  TimesheetEntrySearchResponse,
+  GetTotalHoursParams,
 } from "./types.js";
 
 const TRIPLETEX_API_URL = process.env.TRIPLETEX_API_URL || "https://tripletex.no/v2";
@@ -452,6 +464,13 @@ export class TripletexClient {
   }
 
   // ==================== EMPLOYMENT CRUD ====================
+
+  /**
+   * Get company divisions (virksomheter/underenheter)
+   */
+  async getDivisions(): Promise<TripletexListResponse<Division>> {
+    return this.request<TripletexListResponse<Division>>("GET", "/division", undefined, { count: 100 });
+  }
 
   /**
    * Create a new employment for an employee
@@ -914,7 +933,7 @@ export class TripletexClient {
   async getSupplierInvoices(params?: GetSupplierInvoicesParams): Promise<TripletexListResponse<SupplierInvoice>> {
     return this.request<TripletexListResponse<SupplierInvoice>>("GET", "/supplierInvoice", undefined, {
       ...params,
-      fields: params?.fields || "id,invoiceNumber,invoiceDate,dueDate,amount,amountCurrency,currency(*),supplier(id,name),isCreditNote,voucher(id,number)",
+      fields: params?.fields || "id,invoiceNumber,invoiceDate,amount,amountCurrency,currency(*),supplier(id,name),isCreditNote,voucher(id,number)",
       count: params?.count || 100,
     });
   }
@@ -1015,7 +1034,7 @@ export class TripletexClient {
   async getProducts(params?: GetProductsParams): Promise<TripletexListResponse<Product>> {
     return this.request<TripletexListResponse<Product>>("GET", "/product", undefined, {
       ...params,
-      fields: params?.fields || "id,number,name,description,priceExcludingVat,priceIncludingVat,vatType(*),account(*),isInactive",
+      fields: params?.fields || "id,number,name,description,priceExcludingVatCurrency,priceIncludingVatCurrency,vatType(*),account(*),isInactive",
       count: params?.count || 100,
     });
   }
@@ -1243,6 +1262,197 @@ export class TripletexClient {
         netPaid: totalNet,
       },
     };
+  }
+
+  // ==================== TIMESHEET (Timeføring) ====================
+
+  /**
+   * Søk etter timeregistreringer.
+   * dateFrom og dateTo er PÅKREVD av Tripletex API.
+   */
+  async getTimesheetEntries(params: GetTimesheetEntriesParams): Promise<TimesheetEntrySearchResponse> {
+    return this.request<TimesheetEntrySearchResponse>("GET", "/timesheet/entry", undefined, {
+      ...params,
+      fields: params.fields || "id,version,project(id,name,number),activity(id,name,number),date,hours,chargeableHours,employee(id,firstName,lastName),comment,locked,chargeable,hourlyRate",
+      count: params.count || 100,
+    });
+  }
+
+  /**
+   * Hent en enkelt timeregistrering
+   */
+  async getTimesheetEntry(id: number): Promise<TripletexSingleResponse<TimesheetEntry>> {
+    return this.request<TripletexSingleResponse<TimesheetEntry>>(
+      "GET",
+      `/timesheet/entry/${id}`,
+      undefined,
+      { fields: "*,project(id,name,number),activity(id,name,number),employee(id,firstName,lastName)" }
+    );
+  }
+
+  /**
+   * Opprett ny timeregistrering.
+   * Merk: Kun én registrering per ansatt/dato/aktivitet/prosjekt-kombinasjon.
+   */
+  async createTimesheetEntry(input: CreateTimesheetEntryInput): Promise<TripletexSingleResponse<TimesheetEntry>> {
+    return this.request<TripletexSingleResponse<TimesheetEntry>>("POST", "/timesheet/entry", input);
+  }
+
+  /**
+   * Oppdater en timeregistrering (henter eksisterende først, merger endringer)
+   */
+  async updateTimesheetEntry(id: number, input: UpdateTimesheetEntryInput): Promise<TripletexSingleResponse<TimesheetEntry>> {
+    const current = await this.getTimesheetEntry(id);
+    return this.request<TripletexSingleResponse<TimesheetEntry>>("PUT", `/timesheet/entry/${id}`, {
+      ...current.value,
+      ...input,
+    });
+  }
+
+  /**
+   * Slett en timeregistrering.
+   * Henter gjeldende versjon automatisk hvis version ikke er oppgitt.
+   */
+  async deleteTimesheetEntry(id: number, version?: number): Promise<void> {
+    let ver = version;
+    if (ver === undefined) {
+      const current = await this.getTimesheetEntry(id);
+      ver = current.value.version;
+    }
+    await this.request<void>("DELETE", `/timesheet/entry/${id}`, undefined, {
+      version: ver,
+    });
+  }
+
+  /**
+   * Hent totale timer for en ansatt i en periode
+   */
+  async getTimesheetTotalHours(params?: GetTotalHoursParams): Promise<TripletexSingleResponse<{ value: number }>> {
+    return this.request<TripletexSingleResponse<{ value: number }>>(
+      "GET",
+      "/timesheet/entry/>totalHours",
+      undefined,
+      {
+        employeeId: params?.employeeId,
+        startDate: params?.startDate,
+        endDate: params?.endDate,
+        fields: params?.fields || "*",
+      }
+    );
+  }
+
+  /**
+   * Hent nylig brukte prosjekter for timeregistrering
+   */
+  async getRecentTimesheetProjects(employeeId?: number): Promise<TripletexListResponse<Project>> {
+    return this.request<TripletexListResponse<Project>>(
+      "GET",
+      "/timesheet/entry/>recentProjects",
+      undefined,
+      {
+        employeeId,
+        fields: "id,name,number,displayName,description",
+      }
+    );
+  }
+
+  /**
+   * Hent nylig brukte aktiviteter for timeregistrering
+   */
+  async getRecentTimesheetActivities(projectId: number, employeeId?: number): Promise<TripletexListResponse<Activity>> {
+    return this.request<TripletexListResponse<Activity>>(
+      "GET",
+      "/timesheet/entry/>recentActivities",
+      undefined,
+      {
+        projectId,
+        employeeId,
+        fields: "id,name,number,displayName,description,isProjectActivity",
+      }
+    );
+  }
+
+  // ==================== ACTIVITIES (Aktiviteter) ====================
+
+  /**
+   * Hent liste over aktiviteter
+   */
+  async getActivities(params?: GetActivitiesParams): Promise<TripletexListResponse<Activity>> {
+    return this.request<TripletexListResponse<Activity>>("GET", "/activity", undefined, {
+      ...params,
+      fields: params?.fields || "id,name,number,description,activityType,isProjectActivity,isGeneral,isTask,isDisabled,isChargeable,rate,displayName",
+      count: params?.count || 100,
+    });
+  }
+
+  /**
+   * Hent en enkelt aktivitet
+   */
+  async getActivity(id: number): Promise<TripletexSingleResponse<Activity>> {
+    return this.request<TripletexSingleResponse<Activity>>(
+      "GET",
+      `/activity/${id}`,
+      undefined,
+      { fields: "*" }
+    );
+  }
+
+  /**
+   * Hent aktiviteter tilgjengelig for timeregistrering (filtrert for et prosjekt)
+   */
+  async getActivitiesForTimeSheet(projectId: number, employeeId?: number, date?: string): Promise<TripletexListResponse<Activity>> {
+    return this.request<TripletexListResponse<Activity>>(
+      "GET",
+      "/activity/>forTimeSheet",
+      undefined,
+      {
+        projectId,
+        employeeId,
+        date,
+        fields: "id,name,number,displayName,isProjectActivity,isChargeable",
+      }
+    );
+  }
+
+  // ==================== PROJECTS (Prosjekter) ====================
+
+  /**
+   * Hent liste over prosjekter
+   */
+  async getProjects(params?: GetProjectsParams): Promise<TripletexListResponse<Project>> {
+    return this.request<TripletexListResponse<Project>>("GET", "/project", undefined, {
+      ...params,
+      fields: params?.fields || "id,name,number,displayName,description,projectManager(id,firstName,lastName),startDate,endDate,isClosed,isFixedPrice,customer(id,name)",
+      count: params?.count || 100,
+    });
+  }
+
+  /**
+   * Hent et enkelt prosjekt
+   */
+  async getProject(id: number): Promise<TripletexSingleResponse<Project>> {
+    return this.request<TripletexSingleResponse<Project>>(
+      "GET",
+      `/project/${id}`,
+      undefined,
+      { fields: "*,projectManager(*),customer(*)" }
+    );
+  }
+
+  /**
+   * Hent prosjekter tilgjengelig for timeregistrering
+   */
+  async getProjectsForTimeSheet(employeeId?: number, date?: string): Promise<TripletexListResponse<Project>> {
+    return this.request<TripletexListResponse<Project>>(
+      "GET",
+      "/project/>forTimeSheet",
+      undefined,
+      {
+        employeeId,
+        date,
+        fields: "id,name,number,displayName,description",
+      }
+    );
   }
 }
 

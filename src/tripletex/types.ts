@@ -362,6 +362,7 @@ export interface CreateEmployeeInput {
   employeeNumber?: string;
   bankAccountNumber?: string;
   phoneNumberMobile?: string;
+  userType?: "NO_ACCESS" | "READ" | "WRITE" | "ADMINISTRATOR"; // Required by Tripletex API
   address?: {
     addressLine1?: string;
     addressLine2?: string;
@@ -802,9 +803,9 @@ export interface Product {
   ean?: string;
   elNumber?: string;
   nrfNumber?: string;
-  costExcludingVat?: number;
-  priceExcludingVat?: number;
-  priceIncludingVat?: number;
+  costExcludingVatCurrency?: number;
+  priceExcludingVatCurrency?: number;
+  priceIncludingVatCurrency?: number;
   isInactive?: boolean;
   productUnit?: ProductUnit;
   isStockItem?: boolean;
@@ -1074,8 +1075,8 @@ export interface CreateProductInput {
   name: string;
   number?: string;
   description?: string;
-  priceExcludingVat?: number;
-  priceIncludingVat?: number;
+  priceExcludingVatCurrency?: number;
+  priceIncludingVatCurrency?: number;
   vatType?: { id: number };
   account?: { id: number };
   productUnit?: { id: number };
@@ -1119,8 +1120,8 @@ export interface UpdateProductInput {
   name?: string;
   number?: string;
   description?: string;
-  priceExcludingVat?: number;
-  priceIncludingVat?: number;
+  priceExcludingVatCurrency?: number;
+  priceIncludingVatCurrency?: number;
   vatType?: { id: number };
   account?: { id: number };
   productUnit?: { id: number };
@@ -1137,4 +1138,125 @@ export interface RegisterPaymentInput {
   amount: number;
   kid?: string;
   bankAccount?: { id: number };
+}
+
+// ==================== TIMESHEET (Timeføring) ====================
+
+export interface TimesheetEntry {
+  id: number;
+  version?: number;
+  project?: Project;
+  activity?: Activity;
+  date?: string;
+  hours?: number;
+  chargeableHours?: number;
+  employee?: Employee;
+  comment?: string;
+  locked?: boolean;
+  chargeable?: boolean;
+  hourlyRate?: number;
+  hourlyCost?: number;
+  hourlyCostPercentage?: number;
+  projectChargeableHours?: number;
+}
+
+export interface Activity {
+  id: number;
+  version?: number;
+  name?: string;
+  number?: string;
+  description?: string;
+  activityType?: "GENERAL_ACTIVITY" | "PROJECT_GENERAL_ACTIVITY" | "PROJECT_SPECIFIC_ACTIVITY" | "TASK";
+  isProjectActivity?: boolean;
+  isGeneral?: boolean;
+  isTask?: boolean;
+  isDisabled?: boolean;
+  isChargeable?: boolean;
+  rate?: number;
+  costPercentage?: number;
+  displayName?: string;
+}
+
+export interface GetTimesheetEntriesParams {
+  id?: string;
+  employeeId?: string;
+  projectId?: string;
+  activityId?: string;
+  dateFrom: string;
+  dateTo: string;
+  comment?: string;
+  from?: number;
+  count?: number;
+  sorting?: string;
+  fields?: string;
+}
+
+export interface GetActivitiesParams {
+  id?: string;
+  name?: string;
+  number?: string;
+  description?: string;
+  isProjectActivity?: boolean;
+  isGeneral?: boolean;
+  isChargeable?: boolean;
+  isTask?: boolean;
+  isInactive?: boolean;
+  from?: number;
+  count?: number;
+  sorting?: string;
+  fields?: string;
+}
+
+export interface GetProjectsParams {
+  id?: string;
+  name?: string;
+  number?: string;
+  isOffer?: boolean;
+  projectManagerId?: string;
+  employeeInProjectId?: string;
+  departmentId?: string;
+  startDateFrom?: string;
+  startDateTo?: string;
+  endDateFrom?: string;
+  endDateTo?: string;
+  isClosed?: boolean;
+  isFixedPrice?: boolean;
+  customerId?: string;
+  from?: number;
+  count?: number;
+  sorting?: string;
+  fields?: string;
+}
+
+export interface CreateTimesheetEntryInput {
+  employee: { id: number };
+  activity: { id: number };
+  project?: { id: number };
+  date: string;
+  hours: number;
+  comment?: string;
+}
+
+export interface UpdateTimesheetEntryInput {
+  hours?: number;
+  comment?: string;
+  date?: string;
+  activity?: { id: number };
+  project?: { id: number };
+}
+
+export interface TimesheetEntrySearchResponse {
+  fullResultSize?: number;
+  from?: number;
+  count?: number;
+  versionDigest?: string;
+  values: TimesheetEntry[];
+  sumAllHours?: number;
+}
+
+export interface GetTotalHoursParams {
+  employeeId?: number;
+  startDate?: string;
+  endDate?: string;
+  fields?: string;
 }

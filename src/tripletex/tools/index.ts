@@ -11,6 +11,7 @@ import type { TripletexClient } from "../client.js";
 import { createAccountExpert } from "../subagents/accountExpert.js";
 import { createVatExpert } from "../subagents/vatExpert.js";
 import { createContactMatcher } from "../subagents/contactMatcher.js";
+import { createTimesheetAgent } from "../subagents/timesheetAgent.js";
 import { createAccountingExpertTool } from "../../shared/accountingExpertTool.js";
 
 /**
@@ -460,6 +461,7 @@ VIKTIG: Etter å ha opprettet en ansatt, må du også opprette et arbeidsforhold
             employeeNumber: params.employeeNumber,
             bankAccountNumber: params.bankAccountNumber,
             phoneNumberMobile: params.phoneNumberMobile,
+            userType: "NO_ACCESS" as const, // Required by Tripletex - employee without system login
             address: (params.addressLine1 || params.postalCode || params.city) ? {
               addressLine1: params.addressLine1,
               postalCode: params.postalCode,
@@ -583,10 +585,18 @@ VIKTIG:
             hourlyWage: params.hourlyWage,
           };
 
+          // Auto-fetch company division (required by Tripletex)
+          const divisions = await client.getDivisions();
+          const division = divisions.values?.[0];
+          if (!division) {
+            return { success: false, error: "Ingen virksomhet/underenhet funnet i Tripletex. Opprett en division først." };
+          }
+
           const result = await client.createEmployment({
             employee: { id: params.employeeId },
             startDate: params.startDate,
             endDate: params.endDate,
+            division: { id: division.id },
             employmentDetails: [details],
           });
 
@@ -2463,7 +2473,13 @@ Returnerer fakturaer med beløp, status og forfallsdato.`,
       }),
       execute: async (params) => {
         try {
-          const result = await client.getSupplierInvoices(params);
+          // If invoiceDateFrom is provided but not invoiceDateTo, default to today
+          const searchParams = { ...params };
+          if (searchParams.invoiceDateFrom && !searchParams.invoiceDateTo) {
+            searchParams.invoiceDateTo = new Date().toISOString().split("T")[0];
+          }
+
+          const result = await client.getSupplierInvoices(searchParams);
 
           return {
             success: true,
@@ -2472,7 +2488,6 @@ Returnerer fakturaer med beløp, status og forfallsdato.`,
               id: inv.id,
               invoiceNumber: inv.invoiceNumber,
               invoiceDate: inv.invoiceDate,
-              dueDate: inv.dueDate,
               amount: inv.amount,
               amountCurrency: inv.amountCurrency,
               currency: inv.currency?.code,
@@ -2600,7 +2615,13 @@ Returnerer fakturaer med beløp, status og forfallsdato.`,
       }),
       execute: async (params) => {
         try {
-          const result = await client.getInvoices(params);
+          // If invoiceDateFrom is provided but not invoiceDateTo, default to today
+          const searchParams = { ...params };
+          if (searchParams.invoiceDateFrom && !searchParams.invoiceDateTo) {
+            searchParams.invoiceDateTo = new Date().toISOString().split("T")[0];
+          }
+
+          const result = await client.getInvoices(searchParams);
 
           return {
             success: true,
@@ -2745,20 +2766,21 @@ Hvis du ikke vet om kunden støtter EHF, bruk EMAIL.`,
       execute: async ({ invoiceId, sendType, overrideEmail }) => {
         try {
           const effectiveSendType = sendType || "EMAIL";
+          let emailToUse = overrideEmail;
           
-          // For EMAIL: Sjekk at vi har en e-post å sende til
-          if (effectiveSendType === "EMAIL" && !overrideEmail) {
-            // Hent fakturaen for å få kunde-ID
-            const invoiceResult = await client.getInvoices({ id: String(invoiceId) });
-            if (invoiceResult.values.length > 0) {
-              const invoice = invoiceResult.values[0];
-              // Sjekk om fakturaen har ordre med kunde
-              if (invoice.orders && invoice.orders.length > 0 && invoice.orders[0].customer) {
-                const customerId = invoice.orders[0].customer.id;
+          // For EMAIL: resolve email from customer if not provided
+          if (effectiveSendType === "EMAIL" && !emailToUse) {
+            // Hent fakturaen for å få kunde-ID og e-post
+            try {
+              const invoice = await client.getInvoice(invoiceId);
+              if (invoice.value?.orders && invoice.value.orders.length > 0 && invoice.value.orders[0].customer) {
+                const customerId = invoice.value.orders[0].customer.id;
                 const customerResult = await client.getCustomer(customerId);
                 const customer = customerResult.value;
                 
-                if (!customer.email && !customer.invoiceEmail) {
+                emailToUse = customer.invoiceEmail || customer.email;
+                
+                if (!emailToUse) {
                   return {
                     success: false,
                     error: `Kunden "${customer.name}" har ingen e-postadresse registrert!`,
@@ -2767,10 +2789,12 @@ Hvis du ikke vet om kunden støtter EHF, bruk EMAIL.`,
                   };
                 }
               }
+            } catch {
+              // Kunne ikke hente kunde-info, prøv å sende likevel
             }
           }
           
-          await client.sendInvoice(invoiceId, effectiveSendType, overrideEmail);
+          await client.sendInvoice(invoiceId, effectiveSendType, emailToUse);
 
           const sendMethodDesc = {
             "EMAIL": "e-post",
@@ -2779,7 +2803,7 @@ Hvis du ikke vet om kunden støtter EHF, bruk EMAIL.`,
 
           return {
             success: true,
-            message: `Faktura ${invoiceId} sendt via ${sendMethodDesc[effectiveSendType]}${overrideEmail ? ` til ${overrideEmail}` : ""}`,
+            message: `Faktura ${invoiceId} sendt via ${sendMethodDesc[effectiveSendType]}${emailToUse ? ` til ${emailToUse}` : ""}`,
             sendMethod: effectiveSendType,
           };
         } catch (error) {
@@ -2826,8 +2850,8 @@ Hvis du ikke vet om kunden støtter EHF, bruk EMAIL.`,
               id: p.id,
               name: p.name,
               number: p.number,
-              priceExcludingVat: p.priceExcludingVat,
-              priceIncludingVat: p.priceIncludingVat,
+              priceExcludingVat: p.priceExcludingVatCurrency,
+              priceIncludingVat: p.priceIncludingVatCurrency,
               vatType: p.vatType?.name,
               isInactive: p.isInactive,
             })),
@@ -2856,8 +2880,8 @@ Hvis du ikke vet om kunden støtter EHF, bruk EMAIL.`,
           const result = await client.createProduct({
             name: params.name,
             number: params.number,
-            priceExcludingVat: params.priceExcludingVat,
-            priceIncludingVat: params.priceIncludingVat,
+            priceExcludingVatCurrency: params.priceExcludingVat,
+            priceIncludingVatCurrency: params.priceIncludingVat,
             vatType: params.vatTypeId ? { id: params.vatTypeId } : undefined,
             description: params.description,
           });
@@ -3413,6 +3437,542 @@ VIKTIG: Kall dette verktøyet UMIDDELBART etter at et bilag er opprettet!`,
           return {
             success: false,
             error: error instanceof Error ? error.message : "Ukjent feil ved opplasting",
+          };
+        }
+      },
+    }),
+
+    // ==================== TIMESHEET (Timeføring) ====================
+
+    get_timesheet_entries: tool({
+      description: `Hent timeregistreringer for en gitt periode.
+Søk etter timeføringer basert på dato, ansatt, prosjekt eller aktivitet.
+dateFrom og dateTo er PÅKREVD.
+Bruk dette for å:
+- Se hva som er ført denne uken/måneden
+- Sjekke timer for en ansatt
+- Se timer på et spesifikt prosjekt`,
+      parameters: z.object({
+        dateFrom: z.string().describe("Fra-dato (YYYY-MM-DD). PÅKREVD."),
+        dateTo: z.string().describe("Til-dato (YYYY-MM-DD). PÅKREVD. Merk: Tripletex bruker eksklusiv sluttdato. For én enkelt dag, sett dateTo = dateFrom (justeres automatisk)."),
+        employeeId: z.number().optional().describe("Ansatt-ID for å filtrere på en spesifikk ansatt"),
+        projectId: z.number().optional().describe("Prosjekt-ID for å filtrere på et prosjekt"),
+        activityId: z.number().optional().describe("Aktivitet-ID for å filtrere på en aktivitet"),
+      }),
+      execute: async ({ dateFrom, dateTo, employeeId, projectId, activityId }) => {
+        try {
+          // Tripletex dateTo er eksklusiv - hvis dateFrom === dateTo, juster til neste dag
+          let adjustedDateTo = dateTo;
+          if (dateFrom === dateTo) {
+            const d = new Date(dateTo);
+            d.setDate(d.getDate() + 1);
+            adjustedDateTo = d.toISOString().split("T")[0];
+          }
+
+          const result = await client.getTimesheetEntries({
+            dateFrom,
+            dateTo: adjustedDateTo,
+            employeeId: employeeId?.toString(),
+            projectId: projectId?.toString(),
+            activityId: activityId?.toString(),
+          });
+
+          return {
+            success: true,
+            count: result.values.length,
+            sumAllHours: result.sumAllHours,
+            entries: result.values.map(entry => ({
+              id: entry.id,
+              version: entry.version,
+              date: entry.date,
+              hours: entry.hours,
+              employee: entry.employee
+                ? { id: entry.employee.id, name: `${entry.employee.firstName || ""} ${entry.employee.lastName || ""}`.trim() }
+                : undefined,
+              project: entry.project
+                ? { id: entry.project.id, name: entry.project.name, number: entry.project.number }
+                : undefined,
+              activity: entry.activity
+                ? { id: entry.activity.id, name: entry.activity.name }
+                : undefined,
+              comment: entry.comment,
+              locked: entry.locked,
+            })),
+          };
+        } catch (error) {
+          return {
+            success: false,
+            error: error instanceof Error ? error.message : "Ukjent feil ved henting av timeregistreringer",
+          };
+        }
+      },
+    }),
+
+    create_timesheet_entry: tool({
+      description: `Opprett ny timeregistrering.
+Registrerer timer for en ansatt på en aktivitet (og evt. prosjekt) for en gitt dato.
+VIKTIG: Kun én registrering per ansatt/dato/aktivitet/prosjekt-kombinasjon.
+Hvis det allerede finnes en registrering, bruk update_timesheet_entry i stedet.
+
+Bruk get_projects og get_activities for å finne riktige IDer.`,
+      parameters: z.object({
+        employeeId: z.number().describe("Ansatt-ID (fra get_employees)"),
+        activityId: z.number().describe("Aktivitet-ID (fra get_activities)"),
+        projectId: z.number().optional().describe("Prosjekt-ID (fra get_projects). Valgfritt."),
+        date: z.string().describe("Dato for timeregistrering (YYYY-MM-DD)"),
+        hours: z.number().describe("Antall timer (f.eks. 7.5)"),
+        comment: z.string().optional().describe("Kommentar/beskrivelse av arbeidet"),
+      }),
+      execute: async ({ employeeId, activityId, projectId, date, hours, comment }) => {
+        try {
+          const input = {
+            employee: { id: employeeId },
+            activity: { id: activityId },
+            project: projectId ? { id: projectId } : undefined,
+            date,
+            hours,
+            comment,
+          };
+
+          const result = await client.createTimesheetEntry(input);
+          const entry = result.value;
+
+          return {
+            success: true,
+            message: `Timeregistrering opprettet: ${hours} timer den ${date}`,
+            entry: {
+              id: entry.id,
+              version: entry.version,
+              date: entry.date,
+              hours: entry.hours,
+              employee: entry.employee
+                ? { id: entry.employee.id, name: `${entry.employee.firstName || ""} ${entry.employee.lastName || ""}`.trim() }
+                : undefined,
+              project: entry.project
+                ? { id: entry.project.id, name: entry.project.name }
+                : undefined,
+              activity: entry.activity
+                ? { id: entry.activity.id, name: entry.activity.name }
+                : undefined,
+              comment: entry.comment,
+            },
+          };
+        } catch (error) {
+          const errorMsg = error instanceof Error ? error.message : "Ukjent feil";
+          return {
+            success: false,
+            error: errorMsg,
+            hint: errorMsg.includes("already exists") || errorMsg.includes("duplicate")
+              ? "Det finnes allerede en registrering for denne kombinasjonen. Bruk update_timesheet_entry for å endre den."
+              : undefined,
+          };
+        }
+      },
+    }),
+
+    update_timesheet_entry: tool({
+      description: `Oppdater en eksisterende timeregistrering.
+Endre timer, kommentar, dato, aktivitet eller prosjekt på en eksisterende registrering.
+Bruk get_timesheet_entries for å finne registrerings-ID først.`,
+      parameters: z.object({
+        entryId: z.number().describe("Timeregistrering-ID (fra get_timesheet_entries)"),
+        hours: z.number().optional().describe("Nytt antall timer"),
+        comment: z.string().optional().describe("Ny kommentar"),
+        date: z.string().optional().describe("Ny dato (YYYY-MM-DD)"),
+        activityId: z.number().optional().describe("Ny aktivitet-ID"),
+        projectId: z.number().optional().describe("Ny prosjekt-ID"),
+      }),
+      execute: async ({ entryId, hours, comment, date, activityId, projectId }) => {
+        try {
+          const input: Record<string, unknown> = {};
+          if (hours !== undefined) input.hours = hours;
+          if (comment !== undefined) input.comment = comment;
+          if (date !== undefined) input.date = date;
+          if (activityId !== undefined) input.activity = { id: activityId };
+          if (projectId !== undefined) input.project = { id: projectId };
+
+          const result = await client.updateTimesheetEntry(entryId, input);
+          const entry = result.value;
+
+          return {
+            success: true,
+            message: `Timeregistrering ${entryId} oppdatert`,
+            entry: {
+              id: entry.id,
+              version: entry.version,
+              date: entry.date,
+              hours: entry.hours,
+              project: entry.project
+                ? { id: entry.project.id, name: entry.project.name }
+                : undefined,
+              activity: entry.activity
+                ? { id: entry.activity.id, name: entry.activity.name }
+                : undefined,
+              comment: entry.comment,
+            },
+          };
+        } catch (error) {
+          return {
+            success: false,
+            error: error instanceof Error ? error.message : "Ukjent feil ved oppdatering av timeregistrering",
+          };
+        }
+      },
+    }),
+
+    delete_timesheet_entry: tool({
+      description: `Slett en timeregistrering.
+Fjerner en eksisterende timeregistrering permanent.
+Bruk get_timesheet_entries for å finne registrerings-ID først.
+VIKTIG: Låste registreringer kan ikke slettes.`,
+      parameters: z.object({
+        entryId: z.number().describe("Timeregistrering-ID (fra get_timesheet_entries)"),
+        version: z.number().optional().describe("Versjonsnummer for optimistisk låsing"),
+      }),
+      execute: async ({ entryId, version }) => {
+        try {
+          await client.deleteTimesheetEntry(entryId, version);
+          return {
+            success: true,
+            message: `Timeregistrering ${entryId} slettet`,
+          };
+        } catch (error) {
+          return {
+            success: false,
+            error: error instanceof Error ? error.message : "Ukjent feil ved sletting av timeregistrering",
+          };
+        }
+      },
+    }),
+
+    get_timesheet_summary: tool({
+      description: `Hent timeoversikt/sammendrag for en periode.
+Gir en aggregert oversikt over timer fordelt på prosjekter og aktiviteter.
+Nyttig for å svare på spørsmål som:
+- "Hvor mange timer har jeg ført denne måneden?"
+- "Vis timeoversikt per prosjekt"
+- "Hva har jeg jobbet med denne uken?"`,
+      parameters: z.object({
+        dateFrom: z.string().describe("Fra-dato (YYYY-MM-DD). PÅKREVD."),
+        dateTo: z.string().describe("Til-dato (YYYY-MM-DD). PÅKREVD. For én enkelt dag, sett dateTo = dateFrom (justeres automatisk)."),
+        employeeId: z.number().optional().describe("Ansatt-ID for å filtrere på en spesifikk ansatt"),
+      }),
+      execute: async ({ dateFrom, dateTo, employeeId }) => {
+        try {
+          // Tripletex dateTo er eksklusiv - hvis dateFrom === dateTo, juster til neste dag
+          let adjustedDateTo = dateTo;
+          if (dateFrom === dateTo) {
+            const d = new Date(dateTo);
+            d.setDate(d.getDate() + 1);
+            adjustedDateTo = d.toISOString().split("T")[0];
+          }
+
+          const timesheetAgent = createTimesheetAgent(client, parseInt(companyId));
+          const summary = await timesheetAgent.getTimesheetSummary(dateFrom, adjustedDateTo, employeeId);
+
+          return {
+            success: true,
+            summary: {
+              dateFrom: summary.dateFrom,
+              dateTo: summary.dateTo,
+              employeeName: summary.employeeName,
+              totalHours: summary.totalHours,
+              projectCount: summary.byProject.length,
+              byProject: summary.byProject.map(p => ({
+                projectName: p.projectName,
+                hours: p.hours,
+                entries: p.entries,
+                activities: p.activities.map(a => ({
+                  activityName: a.activityName,
+                  hours: a.hours,
+                  entries: a.entries,
+                })),
+              })),
+              byDate: summary.byDate,
+            },
+          };
+        } catch (error) {
+          return {
+            success: false,
+            error: error instanceof Error ? error.message : "Ukjent feil ved henting av timeoversikt",
+          };
+        }
+      },
+    }),
+
+    get_projects: tool({
+      description: `Hent liste over prosjekter.
+Brukes for å finne prosjekt-ID til timeregistrering.
+Kan filtrere på navn, prosjektnummer, prosjektleder mm.`,
+      parameters: z.object({
+        name: z.string().optional().describe("Søk på prosjektnavn"),
+        number: z.string().optional().describe("Søk på prosjektnummer"),
+        isClosed: z.boolean().optional().describe("Filtrer på åpne/lukkede prosjekter. Standard: kun åpne."),
+        projectManagerId: z.string().optional().describe("Filtrer på prosjektleder-ID"),
+      }),
+      execute: async ({ name, number, isClosed, projectManagerId }) => {
+        try {
+          const result = await client.getProjects({
+            name,
+            number,
+            isClosed: isClosed ?? false,
+            projectManagerId,
+          });
+
+          return {
+            success: true,
+            count: result.values.length,
+            projects: result.values.map(p => ({
+              id: p.id,
+              name: p.name,
+              number: p.number,
+              displayName: p.displayName,
+              description: p.description,
+              startDate: p.startDate,
+              endDate: p.endDate,
+              isClosed: p.isClosed,
+              projectManager: p.projectManager
+                ? { id: p.projectManager.id, name: `${p.projectManager.firstName || ""} ${p.projectManager.lastName || ""}`.trim() }
+                : undefined,
+              customer: p.customer
+                ? { id: p.customer.id, name: p.customer.name }
+                : undefined,
+            })),
+          };
+        } catch (error) {
+          return {
+            success: false,
+            error: error instanceof Error ? error.message : "Ukjent feil ved henting av prosjekter",
+          };
+        }
+      },
+    }),
+
+    get_activities: tool({
+      description: `Hent liste over aktiviteter.
+Brukes for å finne aktivitet-ID til timeregistrering.
+Kan filtrere på navn, prosjektaktivitet, mm.`,
+      parameters: z.object({
+        name: z.string().optional().describe("Søk på aktivitetsnavn"),
+        isProjectActivity: z.boolean().optional().describe("Kun prosjektaktiviteter"),
+        isGeneral: z.boolean().optional().describe("Kun generelle aktiviteter"),
+        projectId: z.number().optional().describe("Hent aktiviteter tilgjengelig for et spesifikt prosjekt (via forTimeSheet-endepunkt)"),
+      }),
+      execute: async ({ name, isProjectActivity, isGeneral, projectId }) => {
+        try {
+          let activities;
+          if (projectId) {
+            // Bruk forTimeSheet-endepunktet for prosjektspesifikke aktiviteter
+            const result = await client.getActivitiesForTimeSheet(projectId);
+            activities = result.values;
+            // Hvis prosjektet ikke har egne aktiviteter, bruk alle aktive aktiviteter
+            if (activities.length === 0) {
+              const allResult = await client.getActivities({
+                name,
+                isProjectActivity,
+                isGeneral,
+                isInactive: false,
+              });
+              activities = allResult.values;
+            }
+          } else {
+            const result = await client.getActivities({
+              name,
+              isProjectActivity,
+              isGeneral,
+              isInactive: false,
+            });
+            activities = result.values;
+          }
+
+          // Hvis name er oppgitt, filtrer client-side (i tillegg til API-filter)
+          if (name && activities.length > 0) {
+            const lowerName = name.toLowerCase();
+            const filtered = activities.filter(a =>
+              a.name?.toLowerCase().includes(lowerName) ||
+              a.displayName?.toLowerCase().includes(lowerName)
+            );
+            if (filtered.length > 0) {
+              activities = filtered;
+            }
+          }
+
+          return {
+            success: true,
+            count: activities.length,
+            activities: activities.map(a => ({
+              id: a.id,
+              name: a.name,
+              number: a.number,
+              displayName: a.displayName,
+              activityType: a.activityType,
+              isProjectActivity: a.isProjectActivity,
+              isGeneral: a.isGeneral,
+              isChargeable: a.isChargeable,
+            })),
+          };
+        } catch (error) {
+          return {
+            success: false,
+            error: error instanceof Error ? error.message : "Ukjent feil ved henting av aktiviteter",
+          };
+        }
+      },
+    }),
+
+    log_hours: tool({
+      description: `Smart timeregistrering med naturlig språk.
+Finner prosjekt og aktivitet automatisk basert på beskrivelse.
+Bruk dette når brukeren beskriver arbeidet i fritekst, f.eks.:
+- "Logg 7.5 timer på Knud-prosjektet, utviklingsarbeid"
+- "Registrer 3 timer møte på salgprosjektet"
+
+Hvis prosjekt eller aktivitet ikke kan matches sikkert, returneres forslag.
+Bruk create_timesheet_entry med eksplisitte IDer som fallback.`,
+      parameters: z.object({
+        employeeId: z.number().describe("Ansatt-ID (fra get_employees)"),
+        date: z.string().describe("Dato for timeregistrering (YYYY-MM-DD)"),
+        hours: z.number().describe("Antall timer (f.eks. 7.5)"),
+        projectQuery: z.string().describe("Prosjektnavn eller beskrivelse for å finne riktig prosjekt"),
+        activityQuery: z.string().optional().describe("Aktivitetsnavn eller beskrivelse. Hvis ikke oppgitt, brukes standard aktivitet."),
+        comment: z.string().optional().describe("Kommentar/beskrivelse av arbeidet"),
+      }),
+      execute: async ({ employeeId, date, hours, projectQuery, activityQuery, comment }) => {
+        try {
+          const timesheetAgent = createTimesheetAgent(client, parseInt(companyId));
+
+          // Finn prosjekt
+          const projectResult = await timesheetAgent.findProjectByName(projectQuery);
+          if (!projectResult.project) {
+            // Hent tilgjengelige prosjekter for forslag
+            const projects = await timesheetAgent.getProjectsWithCache();
+            return {
+              success: false,
+              error: `Kunne ikke finne prosjekt for "${projectQuery}". Vennligst velg fra listen.`,
+              availableProjects: projects.slice(0, 15).map(p => ({
+                id: p.id,
+                name: p.name,
+                number: p.number,
+              })),
+              hint: "Bruk create_timesheet_entry med eksplisitt prosjekt-ID, eller prøv et annet søkeord.",
+            };
+          }
+
+          if (projectResult.confidence === "low") {
+            return {
+              success: false,
+              error: `Usikker match for prosjekt "${projectQuery}". Mener du "${projectResult.project.name}" (ID: ${projectResult.project.id})?`,
+              suggestedProject: {
+                id: projectResult.project.id,
+                name: projectResult.project.name,
+                number: projectResult.project.number,
+              },
+              hint: "Bekreft prosjektet eller bruk create_timesheet_entry med eksplisitt prosjekt-ID.",
+            };
+          }
+
+          // Finn aktivitet
+          let activityId: number | undefined;
+          let activityName: string | undefined;
+
+          if (activityQuery) {
+            const activityResult = await timesheetAgent.findActivityByName(activityQuery, projectResult.project.id);
+            if (!activityResult.activity) {
+              // Hent tilgjengelige aktiviteter for forslag (prøv prosjektspesifikke, fall tilbake til alle)
+              try {
+                let activitiesResp = await client.getActivitiesForTimeSheet(projectResult.project.id);
+                let availableActivities = activitiesResp.values;
+                if (availableActivities.length === 0) {
+                  // Prosjektet har ingen egne aktiviteter, vis alle
+                  const allActivitiesResp = await client.getActivities({ count: 50 });
+                  availableActivities = allActivitiesResp.values;
+                }
+                return {
+                  success: false,
+                  error: `Kunne ikke finne aktivitet for "${activityQuery}" på prosjekt "${projectResult.project.name}".`,
+                  matchedProject: { id: projectResult.project.id, name: projectResult.project.name },
+                  availableActivities: availableActivities.slice(0, 15).map(a => ({
+                    id: a.id,
+                    name: a.name,
+                  })),
+                  hint: "Bruk create_timesheet_entry med eksplisitt aktivitet-ID.",
+                };
+              } catch {
+                return {
+                  success: false,
+                  error: `Kunne ikke finne aktivitet for "${activityQuery}". Bruk get_activities for å se tilgjengelige aktiviteter.`,
+                };
+              }
+            }
+            activityId = activityResult.activity.id;
+            activityName = activityResult.activity.name || undefined;
+          } else {
+            // Prøv å finne standard/generell aktivitet for prosjektet
+            try {
+              const activitiesResp = await client.getActivitiesForTimeSheet(projectResult.project.id);
+              let availableActivities = activitiesResp.values;
+              if (availableActivities.length === 0) {
+                // Prosjektet har ingen egne aktiviteter, bruk alle generelle
+                const allActivitiesResp = await client.getActivities({ isGeneral: true, count: 50 });
+                availableActivities = allActivitiesResp.values;
+              }
+              if (availableActivities.length > 0) {
+                activityId = availableActivities[0].id;
+                activityName = availableActivities[0].name || undefined;
+              } else {
+                return {
+                  success: false,
+                  error: `Ingen aktiviteter funnet for prosjekt "${projectResult.project.name}". Bruk get_activities for å se alle aktiviteter.`,
+                };
+              }
+            } catch {
+              // Fallback: hent generelle aktiviteter
+              const activitiesResp = await client.getActivities({ isGeneral: true, count: 10 });
+              if (activitiesResp.values.length > 0) {
+                activityId = activitiesResp.values[0].id;
+                activityName = activitiesResp.values[0].name || undefined;
+              } else {
+                return {
+                  success: false,
+                  error: "Ingen aktiviteter funnet. Bruk get_activities for å se tilgjengelige aktiviteter.",
+                };
+              }
+            }
+          }
+
+          // Opprett timeregistrering
+          const result = await client.createTimesheetEntry({
+            employee: { id: employeeId },
+            activity: { id: activityId! },
+            project: { id: projectResult.project.id },
+            date,
+            hours,
+            comment,
+          });
+
+          const entry = result.value;
+
+          return {
+            success: true,
+            message: `${hours} timer registrert på "${projectResult.project.name}" - ${activityName || "aktivitet"} den ${date}`,
+            entry: {
+              id: entry.id,
+              version: entry.version,
+              date: entry.date,
+              hours: entry.hours,
+              project: { id: projectResult.project.id, name: projectResult.project.name },
+              activity: { id: activityId, name: activityName },
+              comment: entry.comment,
+            },
+          };
+        } catch (error) {
+          const errorMsg = error instanceof Error ? error.message : "Ukjent feil";
+          return {
+            success: false,
+            error: errorMsg,
+            hint: errorMsg.includes("already exists") || errorMsg.includes("duplicate")
+              ? "Det finnes allerede en registrering for denne kombinasjonen. Bruk update_timesheet_entry for å endre den, eller get_timesheet_entries for å finne den eksisterende."
+              : undefined,
           };
         }
       },
