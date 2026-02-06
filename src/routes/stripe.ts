@@ -355,8 +355,10 @@ router.post("/complete-subscription", async (req: Request, res: Response) => {
     await stripe.customers.update(user.stripeCustomerId, updateData);
 
     // Get trial days from ENV and calculate trial_end timestamp
+    // Only give trial if user hasn't used it before
     const trialDays = parseInt(process.env.TRIAL_DAYS || "0", 10);
-    const trialEnd = trialDays > 0 
+    const canHaveTrial = trialDays > 0 && !user.hasUsedTrial;
+    const trialEnd = canHaveTrial 
       ? Math.floor(Date.now() / 1000) + (trialDays * 24 * 60 * 60)
       : undefined;
 
@@ -373,8 +375,8 @@ router.post("/complete-subscription", async (req: Request, res: Response) => {
     const subscription = await stripe.subscriptions.create(subscriptionParams);
 
     // Update user subscription status in database
-    // Treat "trialing" as "active" for our purposes
-    const status = subscription.status === "trialing" ? "active" : subscription.status;
+    // Preserve trialing status instead of converting to active
+    const status = subscription.status === "trialing" ? "trialing" : subscription.status;
     
     // Get subscription dates safely
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -399,6 +401,8 @@ router.post("/complete-subscription", async (req: Request, res: Response) => {
         subscriptionStatus: status,
         subscriptionStarted,
         subscriptionEnds,
+        // Mark trial as used if this subscription has a trial
+        ...(canHaveTrial && { hasUsedTrial: true }),
       },
     });
 
@@ -485,8 +489,10 @@ router.post("/sync-subscription", async (req: Request, res: Response) => {
     let status: string;
     switch (subscription.status) {
       case "active":
-      case "trialing":
         status = "active";
+        break;
+      case "trialing":
+        status = "trialing";
         break;
       case "canceled":
         status = "cancelled";
@@ -499,7 +505,7 @@ router.post("/sync-subscription", async (req: Request, res: Response) => {
         status = subscription.status;
     }
 
-    const isActive = status === "active" || 
+    const isActive = status === "active" || status === "trialing" ||
       (status === "cancelled" && subscription.current_period_end * 1000 > Date.now());
 
     // Update user in database
@@ -751,16 +757,24 @@ export const handleWebhook = async (req: Request, res: Response) => {
     return;
   }
 
+  // Log ALL incoming webhook events for debugging
+  console.log(`\n========== WEBHOOK RECEIVED ==========`);
+  console.log(`Event type: ${event.type}`);
+  console.log(`Event ID: ${event.id}`);
+  console.log(`Event created: ${new Date(event.created * 1000).toISOString()}`);
+  
   // Handle the event
   switch (event.type) {
     case "payment_intent.succeeded": {
+      console.log(`[payment_intent.succeeded] Processing...`);
       const paymentIntent = event.data.object as Stripe.PaymentIntent & {
         invoice?: string | Stripe.Invoice | null;
       };
       const customerId = paymentIntent.customer as string;
+      console.log(`[payment_intent.succeeded] Customer ID: ${customerId}`);
 
       if (!customerId) {
-        console.log("No customer ID in payment intent, skipping");
+        console.log("[payment_intent.succeeded] No customer ID in payment intent, skipping");
         break;
       }
 
@@ -769,6 +783,7 @@ export const handleWebhook = async (req: Request, res: Response) => {
         const invoiceId = typeof paymentIntent.invoice === "string" 
           ? paymentIntent.invoice 
           : paymentIntent.invoice.id;
+        console.log(`[payment_intent.succeeded] Invoice ID: ${invoiceId}`);
         
         const invoice = await stripe.invoices.retrieve(invoiceId) as Stripe.Invoice & {
           subscription?: string | Stripe.Subscription | null;
@@ -778,78 +793,167 @@ export const handleWebhook = async (req: Request, res: Response) => {
           const subscriptionId = typeof invoice.subscription === "string"
             ? invoice.subscription
             : invoice.subscription.id;
+          console.log(`[payment_intent.succeeded] Subscription ID: ${subscriptionId}`);
           
-          const subscription = await stripe.subscriptions.retrieve(subscriptionId) as unknown as Stripe.Subscription & {
-            current_period_start: number;
-            current_period_end: number;
-          };
+          const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const subData = subscription as any;
+
+          console.log(`[payment_intent.succeeded] Subscription status: ${subData.status}`);
+          console.log(`[payment_intent.succeeded] cancel_at_period_end: ${subData.cancel_at_period_end}`);
+          console.log(`[payment_intent.succeeded] cancel_at: ${subData.cancel_at}`);
+          console.log(`[payment_intent.succeeded] current_period_start: ${subData.current_period_start}`);
+          console.log(`[payment_intent.succeeded] current_period_end: ${subData.current_period_end}`);
+          console.log(`[payment_intent.succeeded] trial_start: ${subData.trial_start}`);
+          console.log(`[payment_intent.succeeded] trial_end: ${subData.trial_end}`);
+
+          // Validate dates before updating - use trial dates as fallback for trialing subscriptions
+          const periodStart = subData.current_period_start || subData.trial_start || subData.start_date;
+          const periodEnd = subData.current_period_end || subData.trial_end;
+          
+          if (!periodStart || !periodEnd) {
+            console.log(`[payment_intent.succeeded] Missing period dates, skipping update`);
+            break;
+          }
+
+          // Don't override cancelled status if subscription is set to cancel
+          const isCancelling = subData.cancel_at_period_end || subData.cancel_at !== null;
+          // Preserve trialing status, don't convert to active
+          let status: string;
+          if (isCancelling) {
+            status = "cancelled";
+          } else if (subData.status === "trialing") {
+            status = "trialing";
+          } else {
+            status = "active";
+          }
+          console.log(`[payment_intent.succeeded] Setting status to: ${status}`);
 
           // Update user subscription status
           await prisma.user.updateMany({
             where: { stripeCustomerId: customerId },
             data: {
-              subscriptionStatus: "active",
-              subscriptionStarted: new Date(subscription.current_period_start * 1000),
-              subscriptionEnds: new Date(subscription.current_period_end * 1000),
+              subscriptionStatus: status,
+              subscriptionStarted: new Date(periodStart * 1000),
+              subscriptionEnds: new Date(periodEnd * 1000),
             },
           });
 
-          console.log(`Subscription activated via payment_intent.succeeded for customer ${customerId}`);
+          console.log(`[payment_intent.succeeded] Database updated for customer ${customerId}`);
         }
+      } else {
+        console.log(`[payment_intent.succeeded] No invoice attached, skipping`);
       }
       break;
     }
 
     case "invoice.payment_succeeded": {
+      console.log(`[invoice.payment_succeeded] Processing...`);
       const invoice = event.data.object as Stripe.Invoice & { subscription: string };
       const customerId = invoice.customer as string;
       const subscriptionId = invoice.subscription;
+      console.log(`[invoice.payment_succeeded] Customer ID: ${customerId}`);
+      console.log(`[invoice.payment_succeeded] Subscription ID: ${subscriptionId}`);
 
       if (!subscriptionId) {
-        console.log("No subscription ID in invoice, skipping");
+        console.log("[invoice.payment_succeeded] No subscription ID in invoice, skipping");
         break;
       }
 
       // Get subscription details
       const subscription = await stripe.subscriptions.retrieve(subscriptionId);
-      const subData = subscription as unknown as {
-        current_period_start: number;
-        current_period_end: number;
-      };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const subData = subscription as any;
+      
+      console.log(`[invoice.payment_succeeded] Subscription status: ${subData.status}`);
+      console.log(`[invoice.payment_succeeded] cancel_at_period_end: ${subData.cancel_at_period_end}`);
+      console.log(`[invoice.payment_succeeded] cancel_at: ${subData.cancel_at}`);
+      console.log(`[invoice.payment_succeeded] current_period_start: ${subData.current_period_start}`);
+      console.log(`[invoice.payment_succeeded] current_period_end: ${subData.current_period_end}`);
+      console.log(`[invoice.payment_succeeded] trial_start: ${subData.trial_start}`);
+      console.log(`[invoice.payment_succeeded] trial_end: ${subData.trial_end}`);
+      
+      // Validate dates before updating - use trial dates as fallback for trialing subscriptions
+      const periodStart = subData.current_period_start || subData.trial_start || subData.start_date;
+      const periodEnd = subData.current_period_end || subData.trial_end;
+      
+      if (!periodStart || !periodEnd) {
+        console.log(`[invoice.payment_succeeded] Missing period dates, skipping update`);
+        break;
+      }
+
+      // Don't override cancelled status if subscription is set to cancel
+      const isCancelling = subData.cancel_at_period_end || subData.cancel_at !== null;
+      // Preserve trialing status, don't convert to active
+      let status: string;
+      if (isCancelling) {
+        status = "cancelled";
+      } else if (subData.status === "trialing") {
+        status = "trialing";
+      } else {
+        status = "active";
+      }
+      console.log(`[invoice.payment_succeeded] Setting status to: ${status}`);
 
       // Update user subscription status
       await prisma.user.updateMany({
         where: { stripeCustomerId: customerId },
         data: {
-          subscriptionStatus: "active",
-          subscriptionStarted: new Date(subData.current_period_start * 1000),
-          subscriptionEnds: new Date(subData.current_period_end * 1000),
+          subscriptionStatus: status,
+          subscriptionStarted: new Date(periodStart * 1000),
+          subscriptionEnds: new Date(periodEnd * 1000),
         },
       });
 
-      console.log(`Subscription activated for customer ${customerId}`);
+      console.log(`[invoice.payment_succeeded] Database updated for customer ${customerId}`);
       break;
     }
 
     case "customer.subscription.updated": {
-      const subscription = event.data.object as Stripe.Subscription & { current_period_end: number };
+      console.log(`[subscription.updated] Processing...`);
+      const subscription = event.data.object as Stripe.Subscription & { 
+        current_period_end: number;
+        cancel_at_period_end: boolean;
+        cancel_at: number | null;
+        canceled_at: number | null;
+      };
       const customerId = subscription.customer as string;
+      
+      console.log(`[subscription.updated] Customer ID: ${customerId}`);
+      console.log(`[subscription.updated] Subscription status: ${subscription.status}`);
+      console.log(`[subscription.updated] cancel_at_period_end: ${subscription.cancel_at_period_end}`);
+      console.log(`[subscription.updated] cancel_at: ${subscription.cancel_at ? new Date(subscription.cancel_at * 1000).toISOString() : 'null'}`);
+      console.log(`[subscription.updated] canceled_at: ${subscription.canceled_at ? new Date(subscription.canceled_at * 1000).toISOString() : 'null'}`);
+      console.log(`[subscription.updated] current_period_end: ${new Date(subscription.current_period_end * 1000).toISOString()}`);
 
       // Map Stripe status to our status
       let status: string;
-      switch (subscription.status) {
-        case "active":
-          status = "active";
-          break;
-        case "canceled":
-          status = "cancelled";
-          break;
-        case "past_due":
-        case "unpaid":
-          status = "expired";
-          break;
-        default:
-          status = subscription.status;
+      
+      // Check if subscription is set to cancel (either at period end or at a specific time)
+      const isCancelling = subscription.cancel_at_period_end || subscription.cancel_at !== null;
+      
+      if (isCancelling) {
+        status = "cancelled";
+        console.log(`[subscription.updated] Subscription is cancelling -> setting status to "cancelled"`);
+      } else {
+        switch (subscription.status) {
+          case "active":
+            status = "active";
+            break;
+          case "trialing":
+            status = "trialing";
+            break;
+          case "canceled":
+            status = "cancelled";
+            break;
+          case "past_due":
+          case "unpaid":
+            status = "expired";
+            break;
+          default:
+            status = subscription.status;
+        }
+        console.log(`[subscription.updated] Subscription is NOT cancelling -> setting status to "${status}"`);
       }
 
       await prisma.user.updateMany({
@@ -860,13 +964,18 @@ export const handleWebhook = async (req: Request, res: Response) => {
         },
       });
 
-      console.log(`Subscription updated for customer ${customerId}: ${status}`);
+      console.log(`[subscription.updated] Database updated: status=${status}`);
+      console.log(`========== WEBHOOK COMPLETE ==========\n`);
       break;
     }
 
     case "customer.subscription.deleted": {
+      console.log(`[subscription.deleted] Processing...`);
       const subscription = event.data.object as Stripe.Subscription & { current_period_end: number };
       const customerId = subscription.customer as string;
+      
+      console.log(`[subscription.deleted] Customer ID: ${customerId}`);
+      console.log(`[subscription.deleted] current_period_end: ${new Date(subscription.current_period_end * 1000).toISOString()}`);
 
       await prisma.user.updateMany({
         where: { stripeCustomerId: customerId },
@@ -876,12 +985,14 @@ export const handleWebhook = async (req: Request, res: Response) => {
         },
       });
 
-      console.log(`Subscription cancelled for customer ${customerId}`);
+      console.log(`[subscription.deleted] Database updated: status=cancelled`);
+      console.log(`========== WEBHOOK COMPLETE ==========\n`);
       break;
     }
 
     default:
-      console.log(`Unhandled event type: ${event.type}`);
+      console.log(`[UNHANDLED] Event type: ${event.type}`);
+      console.log(`========== WEBHOOK COMPLETE ==========\n`);
   }
 
   res.json({ received: true });

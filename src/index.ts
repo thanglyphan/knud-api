@@ -9,6 +9,7 @@ import chatRoutes from "./routes/chat.js";
 import authRoutes from "./routes/auth.js";
 import configRoutes from "./routes/config.js";
 import stripeRoutes, { handleWebhook } from "./routes/stripe.js";
+import subscribeRoutes from "./routes/subscribe.js";
 import { requireAuth, requireAccountingConnection } from "./middleware/auth.js";
 import { createFikenClient } from "./fiken/client.js";
 import { createFikenTools } from "./fiken/tools/index.js";
@@ -73,6 +74,9 @@ app.use("/api/config", configRoutes);
 
 // Stripe routes (products is public, others require auth)
 app.use("/api/stripe", stripeRoutes);
+
+// Subscribe routes (public - email subscription for accounting system notifications)
+app.use("/api/subscribe", subscribeRoutes);
 
 // Chat CRUD routes
 app.use("/api/chats", chatRoutes);

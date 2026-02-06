@@ -22,6 +22,7 @@ model User {
   subscriptionStatus  String    @default("none") // "none" | "active" | "cancelled" | "expired"
   subscriptionStarted DateTime?
   subscriptionEnds    DateTime?
+  hasUsedTrial        Boolean   @default(false) // Sporer om bruker har brukt prøveperiode
 
   // Aktivt regnskapssystem
   activeProvider String? // "fiken" | "tripletex"
@@ -85,4 +86,18 @@ model Message {
 
   @@index([chatId])
   @@index([createdAt])
+}
+
+// E-post subscription for varsler om nye regnskapssystem-integrasjoner
+model EmailSubscription {
+  id               String    @id @default(uuid())
+  email            String
+  accountingSystem String    // "tripletex", "visma", "poweroffice", etc.
+  otherSystem      String?   // Fritekst hvis "other" er valgt
+  createdAt        DateTime  @default(now())
+  unsubscribedAt   DateTime?
+
+  @@unique([email, accountingSystem])
+  @@index([accountingSystem])
+  @@index([email])
 }

@@ -104,7 +104,9 @@ router.get("/fiken", (_req, res) => {
  * 
  * For NEW users: Returns an onboardingToken (JWT) containing encrypted OAuth tokens.
  *                User is NOT created in DB yet - that happens in complete-onboarding.
- * For EXISTING users: Updates tokens and returns sessionToken as before.
+ * For EXISTING users: Updates tokens and returns sessionToken.
+ *                     Also returns canSkipCompanySelection if user has active subscription
+ *                     and a valid saved company.
  */
 router.post("/fiken/callback", async (req, res) => {
   try {
@@ -139,14 +141,71 @@ router.post("/fiken/callback", async (req, res) => {
     });
 
     if (existingUser) {
-      // EXISTING USER: Update tokens and return sessionToken
-      await saveFikenTokens(existingUser.id, tokens);
+      // EXISTING USER: Get existing connection to preserve company info
+      const existingConnection = await prisma.accountingConnection.findUnique({
+        where: { userId_provider: { userId: existingUser.id, provider: "fiken" } },
+        select: { companyId: true, companyName: true, organizationNumber: true },
+      });
+
+      // Update tokens (preserve existing company info)
+      await saveFikenTokens(
+        existingUser.id, 
+        tokens,
+        existingConnection?.companyId ?? undefined,
+        existingConnection?.companyName ?? undefined,
+        existingConnection?.organizationNumber ?? undefined
+      );
       
       // Update active provider to fiken
       await prisma.user.update({
         where: { id: existingUser.id },
         data: { activeProvider: "fiken" },
       });
+
+      // Check if user can skip company selection
+      let canSkipCompanySelection = false;
+      let validatedCompany: { slug: string; name: string; organizationNumber?: string } | null = null;
+
+      if (
+        (existingUser.subscriptionStatus === "active" || existingUser.subscriptionStatus === "trialing") && 
+        existingConnection?.companyId
+      ) {
+        try {
+          // Fetch available companies from Fiken
+          const companiesResponse = await fetch("https://api.fiken.no/api/v2/companies", {
+            headers: { Authorization: `Bearer ${tokens.access_token}` },
+          });
+
+          if (companiesResponse.ok) {
+            const companies = await companiesResponse.json();
+            const savedCompany = companies.find(
+              (c: { slug: string; hasApiAccess?: boolean }) => c.slug === existingConnection.companyId
+            );
+
+            if (savedCompany) {
+              // Check if company has API access
+              if (savedCompany.hasApiAccess !== false) {
+                canSkipCompanySelection = true;
+                validatedCompany = {
+                  slug: existingConnection.companyId,
+                  name: existingConnection.companyName || savedCompany.name,
+                  organizationNumber: existingConnection.organizationNumber || savedCompany.organizationNumber,
+                };
+              }
+              // If no API access, user must go to company selection
+            } else {
+              // Company no longer accessible - clear it from connection
+              await prisma.accountingConnection.update({
+                where: { userId_provider: { userId: existingUser.id, provider: "fiken" } },
+                data: { companyId: null, companyName: null, organizationNumber: null },
+              });
+            }
+          }
+        } catch (error) {
+          console.error("Company validation error:", error);
+          // On error, don't skip - let user select company
+        }
+      }
 
       res.json({
         success: true,
@@ -157,6 +216,8 @@ router.post("/fiken/callback", async (req, res) => {
           name: existingUser.name,
         },
         sessionToken: existingUser.id,
+        canSkipCompanySelection,
+        company: validatedCompany,
       });
     } else {
       // NEW USER: Return onboardingToken, don't create user yet
@@ -173,6 +234,7 @@ router.post("/fiken/callback", async (req, res) => {
         success: true,
         isNewUser: true,
         onboardingToken,
+        canSkipCompanySelection: false,
       });
     }
   } catch (error) {
@@ -258,6 +320,10 @@ router.post("/tripletex/connect", async (req, res) => {
         },
       });
 
+      // For Tripletex, company comes directly from API
+      // User can skip company selection if they have an active subscription (including trialing)
+      const canSkipCompanySelection = existingUser.subscriptionStatus === "active" || existingUser.subscriptionStatus === "trialing";
+
       res.json({
         success: true,
         isNewUser: false,
@@ -272,6 +338,7 @@ router.post("/tripletex/connect", async (req, res) => {
           organizationNumber: userInfo.company.organizationNumber,
         },
         sessionToken: existingUser.id,
+        canSkipCompanySelection,
       });
     } else {
       // NEW USER: Return onboardingToken, don't create user yet
@@ -296,6 +363,7 @@ router.post("/tripletex/connect", async (req, res) => {
           name: userInfo.company.name,
           organizationNumber: userInfo.company.organizationNumber,
         },
+        canSkipCompanySelection: false,
       });
     }
   } catch (error) {
@@ -352,9 +420,10 @@ router.get("/me", async (req, res) => {
     const hasValidToken =
       activeConnection && new Date(activeConnection.expiresAt) > new Date();
 
-    // Check if subscription is active
+    // Check if subscription is active (includes trialing)
     const isSubscriptionActive =
       user.subscriptionStatus === "active" ||
+      user.subscriptionStatus === "trialing" ||
       (user.subscriptionStatus === "cancelled" &&
         user.subscriptionEnds &&
         new Date(user.subscriptionEnds) > new Date());
@@ -396,6 +465,7 @@ router.get("/me", async (req, res) => {
           started: user.subscriptionStarted,
           ends: user.subscriptionEnds,
           isActive: isSubscriptionActive,
+          hasUsedTrial: user.hasUsedTrial,
         },
       },
     });
@@ -410,6 +480,10 @@ router.get("/me", async (req, res) => {
 /**
  * POST /api/auth/logout
  * Logout user and revoke tokens
+ * 
+ * Note: We only invalidate tokens, but preserve:
+ * - activeProvider (user is tied to one accounting system)
+ * - companyId/companyName/organizationNumber (for faster re-login)
  */
 router.post("/logout", async (req, res) => {
   const authHeader = req.headers.authorization;
@@ -438,16 +512,18 @@ router.post("/logout", async (req, res) => {
       }
     }
 
-    // Delete all accounting connections
-    await prisma.accountingConnection.deleteMany({
+    // Nullstill tokens, but keep company info and activeProvider
+    // This allows faster re-login by skipping company selection
+    await prisma.accountingConnection.updateMany({
       where: { userId },
+      data: { 
+        accessToken: "", 
+        refreshToken: null,
+        expiresAt: new Date(0), // Mark as expired
+      },
     });
 
-    // Clear active provider
-    await prisma.user.update({
-      where: { id: userId },
-      data: { activeProvider: null },
-    });
+    // Do NOT clear activeProvider - user is tied to one accounting system
 
     res.json({ success: true });
   } catch (error) {
