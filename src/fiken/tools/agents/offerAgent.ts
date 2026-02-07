@@ -16,9 +16,7 @@ import type { FikenClient } from "../../client.js";
 import { 
   OFFER_AGENT_PROMPT,
   createAttachmentTools,
-  createDelegationToolsForAgent,
   type PendingFile,
-  type DelegationHandler,
 } from "../shared/index.js";
 
 /**
@@ -28,7 +26,6 @@ export function createOfferAgentTools(
   client: FikenClient, 
   companySlug: string,
   pendingFiles?: PendingFile[],
-  onDelegate?: DelegationHandler
 ) {
   
   // ============================================
@@ -114,11 +111,11 @@ export function createOfferAgentTools(
   const createOfferDraft = tool({
     description: "Opprett et tilbudsutkast. Arbeidsflyt: Tilbud -> Ordrebekreftelse -> Faktura.",
     parameters: z.object({
-      customerId: z.number().describe("Kunde-ID (bruk delegateToContactAgent for å finne denne)"),
+      customerId: z.number().describe("Kunde-ID (finnes i samtalehistorikken eller bruk søk)"),
       daysUntilDueDate: z.number().default(14).describe("Dager til forfall"),
       lines: z.array(z.object({
         description: z.string().describe("Beskrivelse av vare/tjeneste"),
-        unitPrice: z.number().describe("Enhetspris i øre (100 = 1 kr)"),
+        grossAmountKr: z.number().describe("Enhetspris i KRONER INKL. MVA. Bruker sier '5000 kr' → grossAmountKr = 5000. ALDRI konverter til øre!"),
         quantity: z.number().describe("Antall"),
         vatType: z.string().optional().default("HIGH").describe("MVA-type: HIGH, MEDIUM, LOW, NONE"),
         incomeAccount: z.string().optional().default("3000").describe("Inntektskonto"),
@@ -129,24 +126,31 @@ export function createOfferAgentTools(
     }),
     execute: async ({ customerId, daysUntilDueDate, lines, offerText, ourReference, yourReference }) => {
       try {
+        const vatRates: Record<string, number> = {
+          HIGH: 0.25, MEDIUM: 0.15, LOW: 0.12, RAW_FISH: 0.1111, NONE: 0, EXEMPT: 0, OUTSIDE: 0,
+        };
         const draft = await client.createOfferDraft({
           customerId,
           daysUntilDueDate,
           type: "offer",
-          lines: lines.map((l) => ({
-            description: l.description,
-            unitPrice: l.unitPrice,
-            quantity: l.quantity,
-            vatType: l.vatType,
-            incomeAccount: l.incomeAccount,
-          })),
+          lines: lines.map((l) => {
+            const rate = vatRates[l.vatType || "HIGH"] ?? 0.25;
+            const netKr = l.grossAmountKr / (1 + rate);
+            return {
+              description: l.description,
+              unitPrice: Math.round(netKr * 100), // Convert net kr to øre
+              quantity: l.quantity,
+              vatType: l.vatType,
+              incomeAccount: l.incomeAccount,
+            };
+          }),
           offerText,
           ourReference,
           yourReference,
         });
         return { 
           success: true, 
-          message: "Tilbudsutkast opprettet", 
+          message: `Tilbudsutkast opprettet (${lines.map(l => l.description + ': ' + l.grossAmountKr + ' kr inkl. mva x ' + l.quantity).join(', ')})`, 
           draft,
         };
       } catch (error) {
@@ -293,7 +297,7 @@ export function createOfferAgentTools(
       daysUntilDueDate: z.number().default(14).describe("Dager til forfall"),
       lines: z.array(z.object({
         description: z.string().describe("Beskrivelse"),
-        unitPrice: z.number().describe("Enhetspris i øre"),
+        grossAmountKr: z.number().describe("Enhetspris i KRONER INKL. MVA. Bruker sier '5000 kr' → grossAmountKr = 5000. ALDRI konverter til øre!"),
         quantity: z.number().describe("Antall"),
         vatType: z.string().optional().default("HIGH").describe("MVA-type"),
         incomeAccount: z.string().optional().default("3000").describe("Inntektskonto"),
@@ -304,24 +308,31 @@ export function createOfferAgentTools(
     }),
     execute: async ({ customerId, daysUntilDueDate, lines, orderConfirmationText, ourReference, yourReference }) => {
       try {
+        const vatRates: Record<string, number> = {
+          HIGH: 0.25, MEDIUM: 0.15, LOW: 0.12, RAW_FISH: 0.1111, NONE: 0, EXEMPT: 0, OUTSIDE: 0,
+        };
         const draft = await client.createOrderConfirmationDraft({
           customerId,
           daysUntilDueDate,
           type: "order_confirmation",
-          lines: lines.map((l) => ({
-            description: l.description,
-            unitPrice: l.unitPrice,
-            quantity: l.quantity,
-            vatType: l.vatType,
-            incomeAccount: l.incomeAccount,
-          })),
+          lines: lines.map((l) => {
+            const rate = vatRates[l.vatType || "HIGH"] ?? 0.25;
+            const netKr = l.grossAmountKr / (1 + rate);
+            return {
+              description: l.description,
+              unitPrice: Math.round(netKr * 100), // Convert net kr to øre
+              quantity: l.quantity,
+              vatType: l.vatType,
+              incomeAccount: l.incomeAccount,
+            };
+          }),
           orderConfirmationText,
           ourReference,
           yourReference,
         });
         return { 
           success: true, 
-          message: "Ordrebekreftelsesutkast opprettet", 
+          message: `Ordrebekreftelsesutkast opprettet (${lines.map(l => l.description + ': ' + l.grossAmountKr + ' kr inkl. mva x ' + l.quantity).join(', ')})`, 
           draft,
         };
       } catch (error) {
@@ -500,18 +511,47 @@ export function createOfferAgentTools(
   });
 
   // ============================================
+  // CONTACT SEARCH (needed for offer/OC creation)
+  // ============================================
+
+  const searchContacts = tool({
+    description: "Søk etter kunder/kontakter i Fiken. Bruk dette for å finne contactId når du skal opprette tilbud eller ordrebekreftelse.",
+    parameters: z.object({
+      name: z.string().optional().describe("Søk etter navn (delvis match)"),
+      customerNumber: z.number().optional().describe("Søk etter kundenummer"),
+    }),
+    execute: async ({ name, customerNumber }) => {
+      try {
+        const params: any = { pageSize: 20 };
+        if (name) params.name = name;
+        if (customerNumber) params.customerNumber = customerNumber;
+        const contacts = await client.getContacts(params);
+        const customers = contacts.filter((c) => c.customer);
+        return {
+          success: true,
+          count: customers.length,
+          contacts: customers.map((c) => ({
+            contactId: c.contactId,
+            name: c.name,
+            email: c.email,
+            customerNumber: c.customerNumber,
+            organizationNumber: c.organizationNumber,
+          })),
+        };
+      } catch (error) {
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : "Kunne ikke søke etter kontakter",
+        };
+      }
+    },
+  });
+
+  // ============================================
   // ATTACHMENT TOOLS (from shared module)
   // ============================================
   
   const attachmentTools = createAttachmentTools(client, pendingFiles);
-
-  // ============================================
-  // DELEGATION TOOLS (to other agents)
-  // ============================================
-  
-  const delegationTools = onDelegate 
-    ? createDelegationToolsForAgent('offer_agent', onDelegate)
-    : {};
 
   // ============================================
   // RETURN ALL TOOLS
@@ -547,13 +587,13 @@ export function createOfferAgentTools(
     getOrderConfirmationCounter,
     initializeOrderConfirmationCounter,
     
+    // Contact search (for finding customer IDs)
+    searchContacts,
+    
     // Attachments (offers/OC don't have direct attachment support in Fiken, 
     // but we include draft attachments for completeness)
     uploadAttachmentToOfferDraft: attachmentTools.uploadAttachmentToOfferDraft,
     uploadAttachmentToOrderConfirmationDraft: attachmentTools.uploadAttachmentToOrderConfirmationDraft,
-    
-    // Delegation
-    ...delegationTools,
   };
 }
 

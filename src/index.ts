@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
 import { openai } from "@ai-sdk/openai";
-import { streamText } from "ai";
+import { streamText, generateText } from "ai";
 import dotenv from "dotenv";
 import { ACCOUNTING_SYSTEM_PROMPT, FIKEN_SYSTEM_PROMPT, TRIPLETEX_SYSTEM_PROMPT } from "./prompts.js";
 import { prisma } from "./db.js";
@@ -13,6 +13,12 @@ import subscribeRoutes from "./routes/subscribe.js";
 import { requireAuth, requireAccountingConnection } from "./middleware/auth.js";
 import { createFikenClient } from "./fiken/client.js";
 import { createFikenTools } from "./fiken/tools/index.js";
+import { 
+  createFikenAgentSystem,
+  ORCHESTRATOR_PROMPT,
+  type FikenAgentType,
+  type DelegationRequest,
+} from "./fiken/tools/agents/index.js";
 import { createTripletexClient } from "./tripletex/client.js";
 import { createTripletexTools } from "./tripletex/tools/index.js";
 import { convertPdfToImages } from "./utils/pdfToImage.js";
@@ -192,10 +198,118 @@ app.post("/api/chat", requireAuth, requireAccountingConnection, async (req, res)
     let baseSystemPrompt: string;
     
     if (provider === "fiken") {
-      // Create Fiken client and tools
+      // Create Fiken client
       const fikenClient = createFikenClient(req.accountingAccessToken!, req.companyId!);
-      tools = createFikenTools(fikenClient, req.companyId!, files);
-      baseSystemPrompt = FIKEN_SYSTEM_PROMPT;
+      
+      // Use multi-agent system with orchestrator
+      const agentSystem = createFikenAgentSystem({
+        client: fikenClient,
+        companySlug: req.companyId!,
+        pendingFiles: files?.map(f => ({ name: f.name, type: f.type, data: f.data })),
+      });
+      
+      // Wire up delegation handler - when orchestrator delegates to an agent,
+      // we run a separate generateText() call with that agent's tools and prompt.
+      // We pass the full conversation history so sub-agents retain context.
+      agentSystem.setDelegationHandler(async (request: DelegationRequest) => {
+        const agentType = request.toAgent;
+        const agentTools = agentSystem.getAgentTools(agentType);
+        const agentPrompt = agentSystem.getAgentPrompt(agentType);
+        
+        console.log(`[Agent] Delegating to ${agentType}: "${request.task}"`);
+        
+        // Build messages array with conversation history + delegation task
+        // This gives the sub-agent full context of what the user has said
+        const agentMessages: Array<{ role: "user" | "assistant"; content: string }> = [];
+        
+        // Include conversation history (simplified to text only)
+        for (const msg of processedMessages) {
+          const content = typeof msg.content === "string" 
+            ? msg.content 
+            : Array.isArray(msg.content)
+              ? msg.content.filter((p: { type: string }) => p.type === "text").map((p: { type: string; text?: string }) => p.text || "").join("\n")
+              : String(msg.content);
+          if (content.trim()) {
+            agentMessages.push({
+              role: msg.role as "user" | "assistant",
+              content,
+            });
+          }
+        }
+        
+        // Add the delegation task as final user message
+        agentMessages.push({
+          role: "user",
+          content: `[Delegert oppgave fra orchestrator]: ${request.task}${request.context ? `\n\nKontekst: ${JSON.stringify(request.context)}` : ""}`,
+        });
+        
+        try {
+          const agentResult = await generateText({
+            model: openai("gpt-4.1-mini"),
+            system: `${agentPrompt}
+
+## DAGENS DATO
+I dag er ${dateStr} (${isoDate}).
+Bruk denne datoen som referanse for alle datoer.
+
+## KONTEKST FRA ORCHESTRATOR
+Du ble delegert en oppgave av hovedagenten. Du har tilgang til hele samtalehistorikken for kontekst.
+Bruk informasjon fra tidligere meldinger for å fullføre oppgaven.`,
+            messages: agentMessages,
+            tools: agentTools as Parameters<typeof generateText>[0]["tools"],
+            maxSteps: 15,
+            toolChoice: "auto",
+            onStepFinish: ({ stepType, toolCalls, toolResults }) => {
+              console.log(`[Agent:${agentType}] Step: ${stepType}`);
+              if (toolCalls?.length) {
+                // Emit tool call info to the stream so frontend can show it
+                const toolNames = toolCalls.map((tc: { toolName: string }) => tc.toolName).join(", ");
+                console.log(`[Agent:${agentType}] Tools: ${toolNames}`);
+              }
+            },
+          });
+          
+          console.log(`[Agent:${agentType}] Completed. Response length: ${agentResult.text.length}`);
+          
+          // Check if any tool results indicate the operation is complete
+          // or that files were uploaded — propagate both to the orchestrator result
+          const completedOps: string[] = [];
+          let filesUploaded = false;
+          for (const step of (agentResult as any).steps || []) {
+            for (const result of step.toolResults || []) {
+              const r = result.result as Record<string, unknown> | undefined;
+              if (r && r._operationComplete) {
+                completedOps.push(result.toolName as string);
+              }
+              if (r && r.fileUploaded) {
+                filesUploaded = true;
+              }
+            }
+          }
+          
+          const resultText = completedOps.length > 0
+            ? `${agentResult.text}\n\n[Operasjoner fullført: ${completedOps.join(", ")}. Ikke deleger denne oppgaven på nytt.]`
+            : agentResult.text;
+          
+          return {
+            success: true,
+            result: resultText,
+            fromAgent: agentType,
+            // Propagate fileUploaded so the frontend can clear pending files
+            ...(filesUploaded && { fileUploaded: true }),
+          };
+        } catch (error) {
+          console.error(`[Agent:${agentType}] Error:`, error);
+          return {
+            success: false,
+            error: error instanceof Error ? error.message : "Agent-feil",
+            fromAgent: agentType,
+          };
+        }
+      });
+      
+      tools = agentSystem.orchestrator.tools;
+      baseSystemPrompt = agentSystem.orchestrator.prompt;
     } else if (provider === "tripletex") {
       // Create Tripletex client and tools
       const tripletexClient = createTripletexClient(req.accountingAccessToken!, req.companyId!);
@@ -223,10 +337,10 @@ Bruk denne datoen som referanse for alle datoer (f.eks. "i dag", "denne måneden
 Brukeren har vedlagt følgende fil${files.length > 1 ? 'er' : ''} til DENNE meldingen:
 ${fileList}
 
-**DU MÅ LASTE OPP ${files.length > 1 ? 'ALLE FILENE' : 'FILEN'}!** Følg disse stegene:
-1. Først: Opprett kjøpet/salget/bilaget med riktig verktøy (createPurchase, createSale, etc.)
-2. Deretter: Last opp ${files.length > 1 ? 'alle filene' : 'filen'} med uploadAttachmentToPurchase(purchaseId), uploadAttachmentToSale(saleId), etc.
-   - Verktøyet laster opp ALLE vedlagte filer automatisk i én operasjon.
+**DU MÅ SØRGE FOR AT ${files.length > 1 ? 'ALLE FILENE' : 'FILEN'} BLIR LASTET OPP!**
+Deleger HELE oppgaven (opprettelse + filopplasting) til riktig agent i ÉN ENKELT delegering.
+Agenten har verktøy for å både opprette (createPurchase, createSale, etc.) og laste opp vedlegg (uploadAttachmentToPurchase, etc.).
+⚠️ VIKTIG: IKKE deleger to ganger (én for opprettelse, én for opplasting) - det vil opprette duplikater!
 
 IKKE spør brukeren om å sende fil${files.length > 1 ? 'ene' : 'en'} på nytt - ${files.length > 1 ? 'filene ER' : 'filen ER'} allerede vedlagt og klar${files.length > 1 ? 'e' : ''} til opplasting!`;
       }
@@ -443,7 +557,9 @@ MEN spør om bankmatch og betalt/ubetalt status.]`;
       // Headers already sent (streaming started), send error in stream format
       const errorMsg = error instanceof Error ? error.message : "Ukjent feil";
       const escapedError = errorMsg.replace(/"/g, '\\"').replace(/\n/g, '\\n');
-      res.write(`0:"\\n\\n❌ Det oppstod en feil: ${escapedError}"\n`);
+      // Send error as text content so the user sees it, plus an error event for the frontend
+      res.write(`0:"\\n\\nBeklager, det oppstod en feil. Prøv gjerne igjen."\n`);
+      res.write(`e:{"error":"${escapedError}"}\n`);
       res.end();
     }
   }
@@ -554,7 +670,8 @@ Bruk denne datoen som referanse for alle datoer.`;
       // Headers already sent (streaming started), send error in stream format
       const errorMsg = error instanceof Error ? error.message : "Ukjent feil";
       const escapedError = errorMsg.replace(/"/g, '\\"').replace(/\n/g, '\\n');
-      res.write(`0:"\\n\\n❌ Det oppstod en feil: ${escapedError}"\n`);
+      res.write(`0:"\\n\\nBeklager, det oppstod en feil. Prøv gjerne igjen."\n`);
+      res.write(`e:{"error":"${escapedError}"}\n`);
       res.end();
     }
   }

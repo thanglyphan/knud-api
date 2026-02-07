@@ -39,6 +39,8 @@ export interface DelegationRequest {
   toAgent: FikenAgentType;
   task: string;
   context?: Record<string, unknown>;
+  /** Full conversation history for context retention across delegations */
+  conversationHistory?: Array<{ role: string; content: unknown }>;
 }
 
 /**

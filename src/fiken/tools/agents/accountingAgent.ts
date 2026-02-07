@@ -15,10 +15,10 @@ import type { FikenClient } from "../../client.js";
 import { 
   ACCOUNTING_AGENT_PROMPT,
   createAttachmentTools,
-  createDelegationToolsForAgent,
+  createAccountHelper,
   type PendingFile,
-  type DelegationHandler,
 } from "../shared/index.js";
+import { createAccountingExpertTool } from "../../../shared/accountingExpertTool.js";
 
 /**
  * Creates the accounting agent tools
@@ -27,7 +27,6 @@ export function createAccountingAgentTools(
   client: FikenClient, 
   companySlug: string,
   pendingFiles?: PendingFile[],
-  onDelegate?: DelegationHandler
 ) {
   
   // ============================================
@@ -201,7 +200,7 @@ Bankkontoer (1920) krever reskontro-format som '1920:10001'.`,
       date: z.string().describe("Bilagsdato (YYYY-MM-DD)"),
       description: z.string().describe("Beskrivelse av bilaget (maks 160 tegn)"),
       lines: z.array(z.object({
-        amount: z.number().describe("Beløp i øre (alltid POSITIV verdi, f.eks. 50000 = 500 kr)"),
+        amountKr: z.number().describe("Beløp i KRONER (alltid POSITIV verdi, f.eks. 500 = 500 kr). ALDRI konverter til øre!"),
         debitAccount: z.string().optional().describe("Debetkonto (f.eks. '5000' for lønn, '6300' for husleie)"),
         creditAccount: z.string().optional().describe("Kreditkonto (f.eks. '1920:10001' for bank, '2400' for leverandørgjeld)"),
         debitVatCode: z.number().optional().describe("MVA-kode for debet"),
@@ -219,15 +218,15 @@ Bankkontoer (1920) krever reskontro-format som '1920:10001'.`,
               error: `Linje ${i + 1}: Må ha debitAccount og/eller creditAccount.`,
             };
           }
-          if (line.amount <= 0) {
+          if (line.amountKr <= 0) {
             return {
               success: false,
-              error: `Linje ${i + 1}: Beløp må være positivt (${line.amount} øre).`,
+              error: `Linje ${i + 1}: Beløp må være positivt (${line.amountKr} kr).`,
             };
           }
           
           // Sjekk for bankkontoer uten reskontro-format
-          const bankAccountPattern = /^19[0-9]{2}$/;
+          const bankAccountPattern = /^1920$/;
           if (line.debitAccount && bankAccountPattern.test(line.debitAccount)) {
             return {
               success: false,
@@ -242,18 +241,19 @@ Bankkontoer (1920) krever reskontro-format som '1920:10001'.`,
           }
         }
 
-        // Beregn total debet og kredit for å sjekke balanse
+        // Konverter kr til øre og beregn total debet og kredit for å sjekke balanse
         let totalDebit = 0;
         let totalCredit = 0;
         for (const line of lines) {
-          if (line.debitAccount) totalDebit += line.amount;
-          if (line.creditAccount) totalCredit += line.amount;
+          const amountOre = Math.round(line.amountKr * 100);
+          if (line.debitAccount) totalDebit += amountOre;
+          if (line.creditAccount) totalCredit += amountOre;
         }
         
         if (totalDebit !== totalCredit) {
           return {
             success: false,
-            error: `Bilag balanserer ikke. Debet: ${totalDebit} øre, Kredit: ${totalCredit} øre. Differanse: ${Math.abs(totalDebit - totalCredit)} øre.`,
+            error: `Bilag balanserer ikke. Debet: ${totalDebit / 100} kr, Kredit: ${totalCredit / 100} kr. Differanse: ${Math.abs(totalDebit - totalCredit) / 100} kr.`,
           };
         }
 
@@ -262,7 +262,7 @@ Bankkontoer (1920) krever reskontro-format som '1920:10001'.`,
             date,
             description,
             lines: lines.map((l) => ({
-              amount: l.amount,
+              amount: Math.round(l.amountKr * 100),
               debitAccount: l.debitAccount,
               creditAccount: l.creditAccount,
               debitVatCode: l.debitVatCode,
@@ -556,18 +556,31 @@ Bankkontoer (1920) krever reskontro-format som '1920:10001'.`,
   });
 
   // ============================================
+  // ACCOUNTING EXPERT TOOL
+  // ============================================
+
+  const accountHelper = createAccountHelper(client, companySlug);
+  
+  const askAccountingExpert = createAccountingExpertTool("fiken", async (description, accountType) => {
+    try {
+      const result = await accountHelper.suggestAccounts(description, accountType);
+      return {
+        success: true,
+        suggestions: result.suggestions,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : "Kunne ikke hente kontoforslag",
+      };
+    }
+  });
+
+  // ============================================
   // ATTACHMENT TOOLS (from shared module)
   // ============================================
   
   const attachmentTools = createAttachmentTools(client, pendingFiles);
-
-  // ============================================
-  // DELEGATION TOOLS (to other agents)
-  // ============================================
-  
-  const delegationTools = onDelegate 
-    ? createDelegationToolsForAgent('accounting_agent', onDelegate)
-    : {};
 
   // ============================================
   // RETURN ALL TOOLS
@@ -597,11 +610,11 @@ Bankkontoer (1920) krever reskontro-format som '1920:10001'.`,
     // Counters
     checkAndInitializeCounters,
     
+    // Accounting expert
+    askAccountingExpert,
+    
     // Attachments
     uploadAttachmentToJournalEntry: attachmentTools.uploadAttachmentToJournalEntry,
-    
-    // Delegation
-    ...delegationTools,
   };
 }
 

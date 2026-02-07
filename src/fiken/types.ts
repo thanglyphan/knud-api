@@ -370,6 +370,7 @@ export interface InvoiceDraftRequest {
   currency?: string;
   lines?: InvoiceLineRequest[];
   bankAccountCode?: string;
+  bankAccountNumber?: string; // Actual bank account number (e.g. "12345678903") - needed for creating invoice from draft
   cash?: boolean;
   projectId?: number;
 }
@@ -705,6 +706,7 @@ export interface PurchaseRequest {
 export interface PurchaseDraft {
   draftId?: number;  // Integer ID - use this for all API operations
   uuid?: string;     // UUID - for reference only, do NOT use for API calls
+  cash?: boolean;
   date?: string;
   dueDate?: string;
   supplierId?: number;
@@ -722,7 +724,8 @@ export interface PurchaseDraft {
 export interface PurchaseDraftLineRequest {
   text: string; // REQUIRED
   vatType: string; // REQUIRED
-  account: string; // REQUIRED
+  incomeAccount: string; // REQUIRED - Fiken uses incomeAccount for draft lines (not "account")
+  account?: string; // For compatibility
   net: number; // REQUIRED - in øre
   gross: number; // REQUIRED - in øre
 }

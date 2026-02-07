@@ -14,8 +14,6 @@ import { tool } from "ai";
 import type { FikenClient } from "../../client.js";
 import { 
   BANK_AGENT_PROMPT,
-  createDelegationToolsForAgent,
-  type DelegationHandler,
 } from "../shared/index.js";
 
 /**
@@ -24,7 +22,6 @@ import {
 export function createBankAgentTools(
   client: FikenClient, 
   companySlug: string,
-  onDelegate?: DelegationHandler
 ) {
   
   // ============================================
@@ -79,20 +76,29 @@ export function createBankAgentTools(
   });
 
   const createBankAccount = tool({
-    description: "Opprett en ny bankkonto i Fiken.",
+    description: "Opprett en ny bankkonto i Fiken. Type MÅ være uppercase: NORMAL, TAX_DEDUCTION, FOREIGN, eller CREDIT_CARD.",
     parameters: z.object({
       name: z.string().describe("Navn på kontoen"),
       bankAccountNumber: z.string().describe("Kontonummer (11 siffer, påkrevd)"),
-      type: z.enum(["NORMAL", "TAX_DEDUCTION", "FOREIGN", "CREDIT_CARD"]).default("NORMAL").describe("Kontotype"),
+      type: z.string().default("NORMAL").describe("Kontotype: NORMAL, TAX_DEDUCTION, FOREIGN, eller CREDIT_CARD (UPPERCASE)"),
       bic: z.string().optional().describe("BIC/SWIFT-kode"),
       iban: z.string().optional().describe("IBAN"),
     }),
     execute: async ({ name, bankAccountNumber, type, bic, iban }) => {
+      // Normalize type to uppercase
+      const normalizedType = type.toUpperCase() as "NORMAL" | "TAX_DEDUCTION" | "FOREIGN" | "CREDIT_CARD";
+      const validTypes = ["NORMAL", "TAX_DEDUCTION", "FOREIGN", "CREDIT_CARD"];
+      if (!validTypes.includes(normalizedType)) {
+        return {
+          success: false,
+          error: `Ugyldig kontotype: ${type}. Gyldige typer: ${validTypes.join(", ")}`,
+        };
+      }
       try {
         const account = await client.createBankAccount({
           name,
           bankAccountNumber,
-          type,
+          type: normalizedType,
           bic,
           iban,
         });
@@ -407,14 +413,6 @@ Søker etter transaksjoner på bankkontoer (1920-serien) innenfor dato-range og 
   });
 
   // ============================================
-  // DELEGATION TOOLS (to other agents)
-  // ============================================
-  
-  const delegationTools = onDelegate 
-    ? createDelegationToolsForAgent('bank_agent', onDelegate)
-    : {};
-
-  // ============================================
   // RETURN ALL TOOLS
   // ============================================
 
@@ -438,9 +436,6 @@ Søker etter transaksjoner på bankkontoer (1920-serien) innenfor dato-range og 
     // Inbox
     searchInbox,
     getInboxDocument,
-    
-    // Delegation
-    ...delegationTools,
   };
 }
 

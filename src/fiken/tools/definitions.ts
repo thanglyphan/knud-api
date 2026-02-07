@@ -343,16 +343,16 @@ export function createFikenTools(client: FikenClient, companySlug: string, pendi
     description: "Opprett et nytt produkt i Fiken. PÅKREVD: name, incomeAccount, vatType, active.",
     parameters: z.object({
       name: z.string().describe("Produktnavn (påkrevd)"),
-      unitPrice: z.number().optional().describe("Enhetspris i øre (100 = 1 kr)"),
+      unitPriceKr: z.number().optional().describe("Enhetspris i KRONER (netto, eks mva). Bruker sier '1500 kr' → unitPriceKr = 1500. ALDRI konverter til øre!"),
       productNumber: z.string().optional().describe("Produktnummer"),
       vatType: z.string().default("HIGH").describe("MVA-type: HIGH (25%), MEDIUM (15%), LOW (12%), NONE, EXEMPT, OUTSIDE"),
       incomeAccount: z.string().default("3000").describe("Inntektskonto (standard: 3000)"),
     }),
-    execute: async ({ name, unitPrice, productNumber, vatType, incomeAccount }) => {
+    execute: async ({ name, unitPriceKr, productNumber, vatType, incomeAccount }) => {
       try {
         const product = await client.createProduct({
           name,
-          unitPrice,
+          unitPrice: unitPriceKr != null ? Math.round(unitPriceKr * 100) : undefined,
           productNumber,
           vatType,
           incomeAccount,
@@ -385,16 +385,16 @@ export function createFikenTools(client: FikenClient, companySlug: string, pendi
     parameters: z.object({
       productId: z.number().describe("Produkt-ID"),
       name: z.string().describe("Produktnavn (påkrevd)"),
-      unitPrice: z.number().optional().describe("Enhetspris i øre"),
+      unitPriceKr: z.number().optional().describe("Enhetspris i KRONER (netto, eks mva). Bruker sier '2000 kr' → unitPriceKr = 2000. ALDRI konverter til øre!"),
       vatType: z.string().describe("MVA-type: HIGH, MEDIUM, LOW, NONE, EXEMPT, OUTSIDE"),
       incomeAccount: z.string().describe("Inntektskonto"),
       active: z.boolean().optional().describe("Er produktet aktivt?"),
     }),
-    execute: async ({ productId, name, unitPrice, vatType, incomeAccount, active }) => {
+    execute: async ({ productId, name, unitPriceKr, vatType, incomeAccount, active }) => {
       try {
         const product = await client.updateProduct(productId, {
           name,
-          unitPrice,
+          unitPrice: unitPriceKr != null ? Math.round(unitPriceKr * 100) : undefined,
           vatType,
           incomeAccount,
           active: active ?? true,
@@ -1012,7 +1012,7 @@ SMART BANKKONTO-LOGIKK:
       lines: z.array(z.object({
         text: z.string().describe("Beskrivelse"),
         vatType: z.string().describe("MVA-type"),
-        account: z.string().describe("Kostnadskonto"),
+        incomeAccount: z.string().describe("Kostnadskonto"),
         net: z.number().describe("Netto i øre"),
         gross: z.number().describe("Brutto i øre"),
       })),
@@ -1028,7 +1028,7 @@ SMART BANKKONTO-LOGIKK:
           lines: lines.map((l) => ({
             text: l.text,
             vatType: l.vatType,
-            account: l.account,
+            incomeAccount: l.incomeAccount,
             net: l.net,
             gross: l.gross,
           })),

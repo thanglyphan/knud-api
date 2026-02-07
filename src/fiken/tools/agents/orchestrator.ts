@@ -45,48 +45,29 @@ export interface AgentConfig {
 export function createAgentConfigs(config: OrchestratorConfig): Record<FikenAgentType, AgentConfig> {
   const { client, companySlug, pendingFiles } = config;
   
-  // Create a delegation handler that will be filled in later
-  let delegationHandler: DelegationHandler | undefined;
-  
-  const setDelegationHandler = (handler: DelegationHandler) => {
-    delegationHandler = handler;
-  };
-  
-  // Wrapper that forwards to the actual handler
-  const onDelegate: DelegationHandler = async (request) => {
-    if (!delegationHandler) {
-      return {
-        success: false,
-        error: "Delegation handler not set",
-        fromAgent: request.toAgent,
-      };
-    }
-    return delegationHandler(request);
-  };
-  
   return {
     invoice_agent: {
-      tools: createInvoiceAgentTools(client, companySlug, pendingFiles, onDelegate),
+      tools: createInvoiceAgentTools(client, companySlug, pendingFiles),
       prompt: INVOICE_AGENT_PROMPT,
     },
     purchase_agent: {
-      tools: createPurchaseAgentTools(client, companySlug, pendingFiles, onDelegate),
+      tools: createPurchaseAgentTools(client, companySlug, pendingFiles),
       prompt: PURCHASE_AGENT_PROMPT,
     },
     contact_agent: {
-      tools: createContactAgentTools(client, companySlug, pendingFiles, onDelegate),
+      tools: createContactAgentTools(client, companySlug, pendingFiles),
       prompt: CONTACT_AGENT_PROMPT,
     },
     offer_agent: {
-      tools: createOfferAgentTools(client, companySlug, pendingFiles, onDelegate),
+      tools: createOfferAgentTools(client, companySlug, pendingFiles),
       prompt: OFFER_AGENT_PROMPT,
     },
     bank_agent: {
-      tools: createBankAgentTools(client, companySlug, onDelegate),
+      tools: createBankAgentTools(client, companySlug),
       prompt: BANK_AGENT_PROMPT,
     },
     accounting_agent: {
-      tools: createAccountingAgentTools(client, companySlug, pendingFiles, onDelegate),
+      tools: createAccountingAgentTools(client, companySlug, pendingFiles),
       prompt: ACCOUNTING_AGENT_PROMPT,
     },
   };
@@ -120,23 +101,22 @@ export function createOrchestratorTools(
 export function getAgentTools(
   agentType: FikenAgentType,
   config: OrchestratorConfig,
-  onDelegate?: DelegationHandler
 ): Record<string, unknown> {
   const { client, companySlug, pendingFiles } = config;
   
   switch (agentType) {
     case 'invoice_agent':
-      return createInvoiceAgentTools(client, companySlug, pendingFiles, onDelegate);
+      return createInvoiceAgentTools(client, companySlug, pendingFiles);
     case 'purchase_agent':
-      return createPurchaseAgentTools(client, companySlug, pendingFiles, onDelegate);
+      return createPurchaseAgentTools(client, companySlug, pendingFiles);
     case 'contact_agent':
-      return createContactAgentTools(client, companySlug, pendingFiles, onDelegate);
+      return createContactAgentTools(client, companySlug, pendingFiles);
     case 'offer_agent':
-      return createOfferAgentTools(client, companySlug, pendingFiles, onDelegate);
+      return createOfferAgentTools(client, companySlug, pendingFiles);
     case 'bank_agent':
-      return createBankAgentTools(client, companySlug, onDelegate);
+      return createBankAgentTools(client, companySlug);
     case 'accounting_agent':
-      return createAccountingAgentTools(client, companySlug, pendingFiles, onDelegate);
+      return createAccountingAgentTools(client, companySlug, pendingFiles);
   }
 }
 
@@ -179,12 +159,6 @@ export function createFikenAgentSystem(config: OrchestratorConfig) {
   // Create orchestrator tools
   const orchestratorTools = createDelegationTools('orchestrator', (request) => delegationHandler(request));
   
-  // Create all agent tools with delegation capability
-  const createAgentToolsWithDelegation = (excludeAgent: FikenAgentType) => {
-    const onDelegate: DelegationHandler = (request) => delegationHandler(request);
-    return getAgentTools(excludeAgent, config, onDelegate);
-  };
-  
   return {
     // Orchestrator configuration
     orchestrator: {
@@ -192,30 +166,30 @@ export function createFikenAgentSystem(config: OrchestratorConfig) {
       prompt: ORCHESTRATOR_PROMPT,
     },
     
-    // Agent configurations
+    // Agent configurations (no delegation tools — only domain tools)
     agents: {
       invoice_agent: {
-        tools: createInvoiceAgentTools(client, companySlug, pendingFiles, (r) => delegationHandler(r)),
+        tools: createInvoiceAgentTools(client, companySlug, pendingFiles),
         prompt: INVOICE_AGENT_PROMPT,
       },
       purchase_agent: {
-        tools: createPurchaseAgentTools(client, companySlug, pendingFiles, (r) => delegationHandler(r)),
+        tools: createPurchaseAgentTools(client, companySlug, pendingFiles),
         prompt: PURCHASE_AGENT_PROMPT,
       },
       contact_agent: {
-        tools: createContactAgentTools(client, companySlug, pendingFiles, (r) => delegationHandler(r)),
+        tools: createContactAgentTools(client, companySlug, pendingFiles),
         prompt: CONTACT_AGENT_PROMPT,
       },
       offer_agent: {
-        tools: createOfferAgentTools(client, companySlug, pendingFiles, (r) => delegationHandler(r)),
+        tools: createOfferAgentTools(client, companySlug, pendingFiles),
         prompt: OFFER_AGENT_PROMPT,
       },
       bank_agent: {
-        tools: createBankAgentTools(client, companySlug, (r) => delegationHandler(r)),
+        tools: createBankAgentTools(client, companySlug),
         prompt: BANK_AGENT_PROMPT,
       },
       accounting_agent: {
-        tools: createAccountingAgentTools(client, companySlug, pendingFiles, (r) => delegationHandler(r)),
+        tools: createAccountingAgentTools(client, companySlug, pendingFiles),
         prompt: ACCOUNTING_AGENT_PROMPT,
       },
     },
@@ -226,7 +200,7 @@ export function createFikenAgentSystem(config: OrchestratorConfig) {
     },
     
     // Helper to get tools for a specific agent
-    getAgentTools: (agentType: FikenAgentType) => getAgentTools(agentType, config, (r) => delegationHandler(r)),
+    getAgentTools: (agentType: FikenAgentType) => getAgentTools(agentType, config),
     
     // Helper to get prompt for a specific agent
     getAgentPrompt,

@@ -15,10 +15,8 @@ import type { FikenClient } from "../../client.js";
 import { 
   PURCHASE_AGENT_PROMPT,
   createAttachmentTools,
-  createDelegationToolsForAgent,
   createAccountHelper,
   type PendingFile,
-  type DelegationHandler,
 } from "../shared/index.js";
 
 /**
@@ -28,7 +26,6 @@ export function createPurchaseAgentTools(
   client: FikenClient, 
   companySlug: string,
   pendingFiles?: PendingFile[],
-  onDelegate?: DelegationHandler
 ) {
   
   // Initialize account helper for smart account suggestions
@@ -148,16 +145,25 @@ ARBEIDSFLYT:
         return {
           success: true,
           count: purchases.length,
-          purchases: purchases.map((p) => ({
-            id: p.purchaseId,
-            identifier: p.identifier,
-            date: p.date,
-            dueDate: p.dueDate,
-            supplierName: p.supplier?.name,
-            supplierId: p.supplierId,
-            paid: p.paid,
-            currency: p.currency,
-          })),
+          purchases: purchases.map((p) => {
+            // Calculate total gross amount from lines
+            const totalGross = p.lines?.reduce((sum, l) => sum + (l.netPrice || 0) + (l.vat || 0), 0) || 0;
+            return {
+              id: p.purchaseId,
+              identifier: p.identifier,
+              date: p.date,
+              dueDate: p.dueDate,
+              supplierName: p.supplier?.name,
+              supplierId: p.supplierId,
+              paid: p.paid,
+              currency: p.currency,
+              kind: (p as any).kind,
+              totalGrossOre: totalGross,
+              totalGrossKr: totalGross / 100,
+              description: p.lines?.[0]?.description,
+              hasAttachments: (p.attachments?.length || 0) > 0,
+            };
+          }),
         };
       } catch (error) {
         return {
@@ -169,14 +175,31 @@ ARBEIDSFLYT:
   });
 
   const getPurchase = tool({
-    description: "Hent detaljert informasjon om et spesifikt kjøp.",
+    description: "Hent detaljert informasjon om et spesifikt kjøp. Beløp returneres i KRONER.",
     parameters: z.object({
       purchaseId: z.number().describe("Kjøp-ID i Fiken"),
     }),
     execute: async ({ purchaseId }) => {
       try {
         const purchase = await client.getPurchase(purchaseId);
-        return { success: true, purchase };
+        return { 
+          success: true, 
+          purchase: {
+            ...purchase,
+            // Convert øre to kr for display
+            lines: purchase.lines?.map((l: any) => ({
+              ...l,
+              netPriceKr: l.netPrice / 100,
+              vatKr: l.vat / 100,
+              grossKr: (l.netPrice + l.vat) / 100,
+            })),
+            payments: purchase.payments?.map((p: any) => ({
+              ...p,
+              amountKr: p.amount / 100,
+            })),
+          },
+          _hint: "Alle beløp er i KRONER (kr), IKKE øre.",
+        };
       } catch (error) {
         return {
           success: false,
@@ -211,11 +234,11 @@ SMART BANKKONTO-LOGIKK:
       currency: z.string().default("NOK").describe("Valuta (standard: NOK)"),
       lines: z.array(z.object({
         description: z.string().describe("Beskrivelse av vare/tjeneste"),
-        netPrice: z.number().describe("Nettopris i øre UTEN MVA (100 = 1 kr). For 1000 kr inkl. 25% MVA: netPrice = 80000 (800 kr)"),
+        grossAmountKr: z.number().describe("BRUTTOBELØP i kroner INKLUDERT MVA. Eksempel: bruker sier '500 kr' → grossAmountKr = 500. ALDRI konverter til øre!"),
         vatType: z.string().describe("MVA-type: HIGH (25%), MEDIUM (15%), LOW (12%), NONE (0%), EXEMPT (fritatt)"),
         account: z.string().optional().describe("Kostnadskonto (f.eks. 6300=leie, 4000=varekjøp, 6540=inventar)"),
       })).describe("Kjøpslinjer"),
-      supplierId: z.number().optional().describe("Leverandør-ID (bruk delegateToContactAgent for å finne denne)"),
+      supplierId: z.number().nullable().optional().describe("Leverandør-ID (contactId fra kontaktoppslag). Utelat hvis ukjent."),
       identifier: z.string().optional().describe("Fakturanummer fra leverandør"),
       dueDate: z.string().optional().describe("Forfallsdato (YYYY-MM-DD) - påkrevd for supplier"),
       paymentAccount: z.string().optional().describe("Bankkonto for betaling (f.eks. '1920:10001')"),
@@ -224,6 +247,110 @@ SMART BANKKONTO-LOGIKK:
     }),
     execute: async ({ date, kind, paid, currency, lines, supplierId, identifier, dueDate, paymentAccount, paymentDate, projectId }) => {
       try {
+        // ============================================
+        // CONVERT grossAmountKr → netPrice in øre
+        // AI sends gross amount in KR (e.g. 500 for 500 kr)
+        // We calculate net = gross / (1 + vatRate) and convert to øre (* 100)
+        // ============================================
+        const vatRates: Record<string, number> = {
+          "HIGH": 0.25,
+          "MEDIUM": 0.15,
+          "LOW": 0.12,
+          "RAW_FISH": 0.1111,
+          "NONE": 0,
+          "EXEMPT": 0,
+          "HIGH_DIRECT": 0.25,
+          "HIGH_BASIS": 0.25,
+          "MEDIUM_DIRECT": 0.15,
+          "MEDIUM_BASIS": 0.15,
+        };
+        
+        const convertedLines = lines.map((l) => {
+          const rate = vatRates[l.vatType] ?? 0;
+          const grossOre = Math.round(l.grossAmountKr * 100); // Convert kr to øre
+          const netOre = Math.round(grossOre / (1 + rate));
+          const vatOre = grossOre - netOre;
+          console.log(`[createPurchase] Line: "${l.description}" | gross=${l.grossAmountKr} kr → ${grossOre} øre | net=${netOre} øre | vat=${vatOre} øre (${l.vatType})`);
+          return {
+            description: l.description,
+            vatType: l.vatType,
+            netPrice: netOre,
+            vat: vatOre,
+            account: l.account,
+          };
+        });
+        
+        const newTotalNet = convertedLines.reduce((sum, l) => sum + l.netPrice, 0);
+        
+        // ============================================
+        // DUPLICATE CHECK: Search for existing purchases
+        // on the same date with similar amount/description
+        // ============================================
+        
+        try {
+          const existingPurchases = await client.getPurchases({
+            dateGe: date,
+            dateLe: date,
+            pageSize: 100,
+          });
+          
+          // Check each existing purchase for potential duplicate
+          const duplicates = existingPurchases.filter((p) => {
+            if (!p.lines || p.lines.length === 0) return false;
+            
+            // Calculate existing purchase total net
+            const existingTotalNet = p.lines.reduce((sum, l) => sum + (l.netPrice || 0), 0);
+            
+            // Check if amounts match (within 1 kr / 100 øre margin for rounding)
+            const amountMatch = Math.abs(existingTotalNet - newTotalNet) < 100;
+            
+            // Check if description is similar (case-insensitive substring match)
+            const newDesc = lines[0]?.description?.toLowerCase() || "";
+            const existingDesc = p.lines[0]?.description?.toLowerCase() || "";
+            const descMatch = newDesc && existingDesc && (
+              newDesc.includes(existingDesc) || 
+              existingDesc.includes(newDesc) ||
+              newDesc === existingDesc
+            );
+            
+            // Check supplier match
+            const supplierMatch = supplierId && p.supplierId && supplierId === p.supplierId;
+            
+            // A duplicate if amount matches AND (description or supplier matches)
+            return amountMatch && (descMatch || supplierMatch);
+          });
+          
+          if (duplicates.length > 0) {
+            const dup = duplicates[0];
+            const dupGross = dup.lines?.reduce((sum, l) => sum + (l.netPrice || 0) + (l.vat || 0), 0) || 0;
+            return {
+              success: false,
+              _operationComplete: true,
+              duplicateFound: true,
+              message: `⚠️ DUPLIKAT FUNNET! Et lignende kjøp finnes allerede:\n` +
+                `- ID: ${dup.purchaseId}\n` +
+                `- Dato: ${dup.date}\n` +
+                `- Beløp: ${(dupGross / 100).toFixed(2)} kr\n` +
+                `- Beskrivelse: ${dup.lines?.[0]?.description || "Ukjent"}\n` +
+                `- Leverandør: ${dup.supplier?.name || "Ukjent"}\n` +
+                `- Har vedlegg: ${(dup.attachments?.length || 0) > 0 ? "Ja" : "Nei"}\n\n` +
+                `Bruk uploadAttachmentToPurchase med purchaseId ${dup.purchaseId} hvis du kun trenger å laste opp vedlegg.\n` +
+                `IKKE opprett et nytt kjøp.`,
+              existingPurchase: {
+                purchaseId: dup.purchaseId,
+                date: dup.date,
+                totalGrossKr: dupGross / 100,
+                description: dup.lines?.[0]?.description,
+                supplierName: dup.supplier?.name,
+                hasAttachments: (dup.attachments?.length || 0) > 0,
+              },
+            };
+          }
+        } catch (dupCheckError) {
+          // If duplicate check fails, log but continue with creation
+          console.warn("[createPurchase] Duplicate check failed, proceeding with creation:", dupCheckError);
+        }
+        
         // SMART BANKKONTO-LOGIKK for kontantkjøp
         let effectivePaymentAccount = paymentAccount;
         
@@ -253,39 +380,13 @@ SMART BANKKONTO-LOGIKK:
           }
         }
         
-        // Calculate VAT for each line based on vatType
-        const vatRates: Record<string, number> = {
-          "HIGH": 0.25,
-          "MEDIUM": 0.15,
-          "LOW": 0.12,
-          "RAW_FISH": 0.1111,
-          "NONE": 0,
-          "EXEMPT": 0,
-          "HIGH_DIRECT": 0.25,
-          "HIGH_BASIS": 0.25,
-          "MEDIUM_DIRECT": 0.15,
-          "MEDIUM_BASIS": 0.15,
-        };
-        
-        const linesWithVat = lines.map((l) => {
-          const rate = vatRates[l.vatType] ?? 0;
-          const vat = Math.round(l.netPrice * rate);
-          return {
-            description: l.description,
-            vatType: l.vatType,
-            netPrice: l.netPrice,
-            vat: vat,
-            account: l.account,
-          };
-        });
-        
         const requestBody = {
           date,
           kind,
           paid,
           currency,
-          lines: linesWithVat,
-          supplierId,
+          lines: convertedLines,
+          supplierId: supplierId ?? undefined,
           dueDate,
           paymentAccount: effectivePaymentAccount,
           paymentDate: paymentDate || (paid && effectivePaymentAccount ? date : undefined),
@@ -347,16 +448,30 @@ SMART BANKKONTO-LOGIKK:
     parameters: z.object({
       purchaseId: z.number().describe("Kjøp-ID"),
       date: z.string().describe("Betalingsdato (YYYY-MM-DD)"),
-      amount: z.number().describe("Beløp i øre"),
-      account: z.string().describe("Bankkonto (f.eks. '1920')"),
+      amountKr: z.number().describe("Beløp i KRONER. Eksempel: betaling på 500 kr → amountKr = 500. ALDRI konverter til øre!"),
+      account: z.string().optional().describe("Bankkonto-kode (f.eks. '1920:10001'). Standard: auto-hentes fra bankkonto."),
     }),
-    execute: async ({ purchaseId, date, amount, account }) => {
+    execute: async ({ purchaseId, date, amountKr, account }) => {
       try {
-        const payment = await client.addPurchasePayment(purchaseId, { date, amount, account });
+        const amountOre = Math.round(amountKr * 100);
+        // Auto-resolve bank account code if not provided or missing reskontro suffix
+        let resolvedAccount = account || "1920";
+        if (!resolvedAccount.includes(":")) {
+          try {
+            const bankAccounts = await client.getBankAccounts();
+            const match = bankAccounts.find((ba: any) => ba.accountCode?.startsWith(resolvedAccount + ":"));
+            if (match) {
+              resolvedAccount = match.accountCode;
+            }
+          } catch (e) {
+            // Fall back to provided account
+          }
+        }
+        const payment = await client.addPurchasePayment(purchaseId, { date, amount: amountOre, account: resolvedAccount });
         return {
           success: true,
           _operationComplete: true,
-          message: `Betaling på ${amount / 100} kr registrert`,
+          message: `Betaling på ${amountKr} kr registrert`,
           payment,
         };
       } catch (error) {
@@ -394,29 +509,36 @@ SMART BANKKONTO-LOGIKK:
       cash: z.boolean().describe("Er dette kontantkjøp?"),
       paid: z.boolean().describe("Er det betalt?"),
       lines: z.array(z.object({
-        text: z.string().describe("Beskrivelse"),
+        description: z.string().describe("Beskrivelse av vare/tjeneste"),
         vatType: z.string().describe("MVA-type"),
         account: z.string().describe("Kostnadskonto"),
-        net: z.number().describe("Netto i øre"),
-        gross: z.number().describe("Brutto i øre"),
+        grossAmountKr: z.number().describe("BRUTTOBELØP i KRONER inkl. MVA. Eksempel: 500 kr → grossAmountKr = 500. ALDRI konverter til øre!"),
       })),
-      supplierId: z.number().optional(),
+      supplierId: z.number().nullable().optional(),
       date: z.string().optional(),
       dueDate: z.string().optional(),
     }),
     execute: async ({ cash, paid, lines, supplierId, date, dueDate }) => {
       try {
-        const draft = await client.createPurchaseDraft({
+        const vatRates: Record<string, number> = {
+          HIGH: 0.25, MEDIUM: 0.15, LOW: 0.12, EXEMPT: 0, NONE: 0, OUTSIDE: 0,
+        };
+         const draft = await client.createPurchaseDraft({
           cash,
           paid,
-          lines: lines.map((l) => ({
-            text: l.text,
-            vatType: l.vatType,
-            account: l.account,
-            net: l.net,
-            gross: l.gross,
-          })),
-          supplierId,
+          lines: lines.map((l) => {
+            const grossOre = Math.round(l.grossAmountKr * 100);
+            const rate = vatRates[l.vatType] ?? 0.25;
+            const netOre = Math.round(grossOre / (1 + rate));
+            return {
+              text: l.description,
+              vatType: l.vatType,
+              incomeAccount: l.account,
+              net: netOre,
+              gross: grossOre,
+            };
+          }),
+          supplierId: supplierId ?? undefined,
           date,
           dueDate,
         });
@@ -431,19 +553,76 @@ SMART BANKKONTO-LOGIKK:
   });
 
   const createPurchaseFromDraft = tool({
-    description: "Opprett et kjøp fra et eksisterende utkast.",
+    description: "Opprett et kjøp fra et eksisterende utkast. BRUK ALLTID DETTE VERKTØYET direkte — det håndterer manglende dato automatisk. Du trenger IKKE hente utkastet først.",
     parameters: z.object({
       draftId: z.number().describe("Utkast-ID (heltall fra getPurchaseDrafts, IKKE uuid)"),
     }),
     execute: async ({ draftId }) => {
       try {
-        const purchase = await client.createPurchaseFromDraft(draftId);
-        return { 
-          success: true, 
-          _operationComplete: true,
-          message: "Kjøp opprettet fra utkast", 
-          purchase 
-        };
+        // First try the native API
+        try {
+          const purchase = await client.createPurchaseFromDraft(draftId);
+          // If successful, delete the draft
+          return { 
+            success: true, 
+            _operationComplete: true,
+            message: "Kjøp opprettet fra utkast", 
+            purchase 
+          };
+        } catch (apiError) {
+          // Fiken API often fails with "Mangler dato" — fall back to manual creation
+          const draft = await client.getPurchaseDraft(draftId);
+          const today = new Date().toISOString().split("T")[0];
+          
+          const isCash = draft.cash ?? false;
+          const isPaid = draft.paid ?? false;
+          
+          // Build purchase request from draft data
+          let paymentAccount: string | undefined;
+          if (isCash || isPaid) {
+            try {
+              const bankAccounts = await client.getBankAccounts();
+              if (bankAccounts.length > 0) {
+                paymentAccount = (bankAccounts[0] as any).accountCode || "1920:10001";
+              }
+            } catch { paymentAccount = "1920:10001"; }
+          }
+          
+          const vatRates: Record<string, number> = {
+            HIGH: 0.25, MEDIUM: 0.15, LOW: 0.12, EXEMPT: 0, NONE: 0, OUTSIDE: 0,
+          };
+          
+          const purchase = await client.createPurchase({
+            date: today,
+            kind: isCash ? "cash_purchase" : "supplier",
+            paid: isPaid,
+            currency: draft.currency || "NOK",
+            lines: (draft.lines || []).map((l: any) => {
+              const grossOre = l.gross || 0;
+              const rate = vatRates[l.vatType] ?? 0.25;
+              const netOre = Math.round(grossOre / (1 + rate));
+              return {
+                description: l.text || l.description || "",
+                netPrice: netOre,
+                vatType: l.vatType || "HIGH",
+                account: l.incomeAccount || l.account || "6800",
+              };
+            }),
+            ...(draft.supplierId ? { supplierId: draft.supplierId } : {}),
+            ...(draft.dueDate ? { dueDate: draft.dueDate } : {}),
+            ...(paymentAccount && isPaid ? { paymentAccount } : {}),
+          } as any);
+          
+          // Delete the draft since we created the purchase manually
+          try { await client.deletePurchaseDraft(draftId); } catch { /* ignore */ }
+          
+          return { 
+            success: true, 
+            _operationComplete: true,
+            message: "Kjøp opprettet fra utkast (med dagens dato)", 
+            purchase 
+          };
+        }
       } catch (error) {
         return {
           success: false,
@@ -501,18 +680,47 @@ SMART BANKKONTO-LOGIKK:
   });
 
   // ============================================
+  // CONTACT SEARCH (for finding suppliers)
+  // ============================================
+
+  const searchContacts = tool({
+    description: "Søk etter leverandører/kontakter i Fiken. Bruk dette for å finne contactId (supplierId) når du skal opprette leverandørfaktura.",
+    parameters: z.object({
+      name: z.string().optional().describe("Søk etter navn (delvis match)"),
+      supplierNumber: z.number().optional().describe("Søk etter leverandørnummer"),
+    }),
+    execute: async ({ name, supplierNumber }) => {
+      try {
+        const params: any = { pageSize: 20 };
+        if (name) params.name = name;
+        if (supplierNumber) params.supplierNumber = supplierNumber;
+        const contacts = await client.getContacts(params);
+        const suppliers = contacts.filter((c) => c.supplier);
+        return {
+          success: true,
+          count: suppliers.length,
+          contacts: suppliers.map((c) => ({
+            contactId: c.contactId,
+            name: c.name,
+            email: c.email,
+            supplierNumber: c.supplierNumber,
+            organizationNumber: c.organizationNumber,
+          })),
+        };
+      } catch (error) {
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : "Kunne ikke søke etter kontakter",
+        };
+      }
+    },
+  });
+
+  // ============================================
   // ATTACHMENT TOOLS
   // ============================================
   
   const attachmentTools = createAttachmentTools(client, pendingFiles);
-
-  // ============================================
-  // DELEGATION TOOLS
-  // ============================================
-  
-  const delegationTools = onDelegate 
-    ? createDelegationToolsForAgent('purchase_agent', onDelegate)
-    : {};
 
   // ============================================
   // RETURN ALL TOOLS
@@ -541,12 +749,12 @@ SMART BANKKONTO-LOGIKK:
     // Bank accounts
     getBankAccounts,
     
+    // Contact search (for finding suppliers)
+    searchContacts,
+    
     // Attachments
     uploadAttachmentToPurchase: attachmentTools.uploadAttachmentToPurchase,
     uploadAttachmentToPurchaseDraft: attachmentTools.uploadAttachmentToPurchaseDraft,
-    
-    // Delegation
-    ...delegationTools,
   };
 }
 

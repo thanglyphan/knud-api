@@ -263,20 +263,94 @@ async function runScenarios() {
   }
   
   // ============================================
-  // Scenario 6: Cross-agent delegation test
+  // Scenario 6: Verify no delegation tools on sub-agents (Bug 10 fix)
   // ============================================
-  log("\nSCENARIO 6: Agent-delegering", "cyan");
+  log("\nSCENARIO 6: Ingen delegeringsverktøy på sub-agenter (Bug 10 fiks)", "cyan");
   log("-".repeat(40), "dim");
   
-  log("  → Invoice agent delegerer til contact_agent...", "yellow");
-  const delegationResult = await (invoiceTools as any).delegateToContactAgent.execute({
-    task: "Finn kunde med navn 'Ola Nordmann'",
-    context: { name: "Ola Nordmann" },
+  log("  → Sjekker at invoice agent IKKE har delegeringsverktøy...", "yellow");
+  const hasContactDelegation = 'delegateToContactAgent' in invoiceTools;
+  const hasPurchaseDelegation = 'delegateToPurchaseAgent' in invoiceTools;
+  
+  if (!hasContactDelegation && !hasPurchaseDelegation) {
+    log("  ✓ Sub-agenter har ingen delegeringsverktøy (Bug 10 fikset)", "green");
+  } else {
+    log("  ✗ Sub-agenter har fortsatt delegeringsverktøy (Bug 10 IKKE fikset)", "red");
+  }
+  
+  // ============================================
+  // Scenario 7: Duplicate purchase detection (Bug 12 fix)
+  // ============================================
+  log("\nSCENARIO 7: Duplikat-deteksjon for kjøp (Bug 12 fiks)", "cyan");
+  log("-".repeat(40), "dim");
+  
+  // Create a mock client that returns an existing purchase on same date with same amount
+  const dupMockClient = {
+    ...mockClient,
+    getPurchases: async () => [
+      { 
+        purchaseId: 42, 
+        date: "2026-02-07",
+        supplier: { name: "IKEA AS" },
+        supplierId: 10,
+        lines: [
+          { description: "Møbler og tilbehør", netPrice: 851181, vat: 212795, grossPrice: 1063976 }
+        ],
+        attachments: [{ identifier: "att-1" }],
+        paid: true,
+      }
+    ],
+    createPurchase: async (data: any) => ({ purchaseId: 99, ...data }),
+    getBankAccounts: async () => [
+      { bankAccountId: 1, name: "Demo-konto", accountCode: "1920:10001", bankAccountNumber: "12345678901", inactive: false },
+    ],
+  } as any;
+  
+  const dupSystem = createFikenAgentSystem({ client: dupMockClient, companySlug: "test" });
+  const dupPurchaseTools = dupSystem.agents.purchase_agent.tools;
+  
+  // Try to create the same purchase (same date, same net amount, same supplier)
+  log("  → Prøver å opprette duplikat-kjøp (IKEA, 10639.76 kr, 2026-02-07)...", "yellow");
+  const dupResult = await (dupPurchaseTools.createPurchase as any).execute({
+    date: "2026-02-07",
+    kind: "cash_purchase",
+    paid: true,
+    currency: "NOK",
+    lines: [
+      { description: "Møbler og tilbehør", netPrice: 851181, vatType: "HIGH", account: "4000" }
+    ],
+    supplierId: 10,
+    paymentAccount: "1920:10001",
   });
   
-  if (delegationResult.success) {
-    log("  ✓ Delegering vellykket", "green");
-    log(`    Delegert til: ${delegationResult.delegatedTo}`, "dim");
+  if (dupResult.duplicateFound) {
+    log(`  ✓ Duplikat oppdaget! Eksisterende kjøp-ID: ${dupResult.existingPurchase.purchaseId}`, "green");
+    log(`    Melding: ${dupResult.message.split('\n')[0]}`, "dim");
+  } else if (dupResult.success) {
+    log("  ✗ Duplikat ble IKKE oppdaget - kjøp ble opprettet på nytt!", "red");
+  } else {
+    log(`  ✗ Uventet feil: ${dupResult.error}`, "red");
+  }
+  
+  // Also test that a genuinely new purchase goes through
+  log("  → Oppretter unikt kjøp (annet beløp)...", "yellow");
+  const uniqueResult = await (dupPurchaseTools.createPurchase as any).execute({
+    date: "2026-02-07",
+    kind: "cash_purchase",
+    paid: true,
+    currency: "NOK",
+    lines: [
+      { description: "Noe helt annet", netPrice: 50000, vatType: "HIGH", account: "6800" }
+    ],
+    paymentAccount: "1920:10001",
+  });
+  
+  if (uniqueResult.success && !uniqueResult.duplicateFound) {
+    log(`  ✓ Unikt kjøp opprettet (ID: ${uniqueResult.purchase.purchaseId})`, "green");
+  } else if (uniqueResult.duplicateFound) {
+    log("  ✗ Unikt kjøp ble feilaktig flagget som duplikat!", "red");
+  } else {
+    log(`  ✗ Feil: ${uniqueResult.error}`, "red");
   }
   
   // ============================================

@@ -14,9 +14,7 @@ import type { FikenClient } from "../../client.js";
 import { 
   CONTACT_AGENT_PROMPT,
   createAttachmentTools,
-  createDelegationToolsForAgent,
   type PendingFile,
-  type DelegationHandler,
 } from "../shared/index.js";
 
 /**
@@ -26,7 +24,6 @@ export function createContactAgentTools(
   client: FikenClient, 
   companySlug: string,
   pendingFiles?: PendingFile[],
-  onDelegate?: DelegationHandler
 ) {
   
   // ============================================
@@ -58,7 +55,8 @@ export function createContactAgentTools(
           success: true,
           count: contacts.length,
           contacts: contacts.map((c) => ({
-            id: c.contactId,
+            contactId: c.contactId,
+            _note: "BRUK contactId (IKKE customerNumber) for createInvoice, createOfferDraft, etc.",
             name: c.name,
             email: c.email,
             organizationNumber: c.organizationNumber,
@@ -299,16 +297,16 @@ export function createContactAgentTools(
     description: "Opprett et nytt produkt i Fiken. Produkter brukes i fakturalinjer.",
     parameters: z.object({
       name: z.string().describe("Produktnavn (påkrevd)"),
-      unitPrice: z.number().optional().describe("Enhetspris i øre (100 = 1 kr)"),
+      unitPriceKr: z.number().optional().describe("Enhetspris i KRONER (netto, eks mva). Bruker sier '1500 kr' → unitPriceKr = 1500. ALDRI konverter til øre!"),
       productNumber: z.string().optional().describe("Produktnummer"),
       vatType: z.string().default("HIGH").describe("MVA-type: HIGH (25%), MEDIUM (15%), LOW (12%), NONE, EXEMPT, OUTSIDE"),
       incomeAccount: z.string().default("3000").describe("Inntektskonto (standard: 3000)"),
     }),
-    execute: async ({ name, unitPrice, productNumber, vatType, incomeAccount }) => {
+    execute: async ({ name, unitPriceKr, productNumber, vatType, incomeAccount }) => {
       try {
         const product = await client.createProduct({
           name,
-          unitPrice,
+          unitPrice: unitPriceKr != null ? Math.round(unitPriceKr * 100) : undefined,
           productNumber,
           vatType,
           incomeAccount,
@@ -341,16 +339,16 @@ export function createContactAgentTools(
     parameters: z.object({
       productId: z.number().describe("Produkt-ID"),
       name: z.string().describe("Produktnavn (påkrevd)"),
-      unitPrice: z.number().optional().describe("Enhetspris i øre"),
+      unitPriceKr: z.number().optional().describe("Enhetspris i KRONER (netto, eks mva). Bruker sier '2000 kr' → unitPriceKr = 2000. ALDRI konverter til øre!"),
       vatType: z.string().describe("MVA-type: HIGH, MEDIUM, LOW, NONE, EXEMPT, OUTSIDE"),
       incomeAccount: z.string().describe("Inntektskonto"),
       active: z.boolean().optional().describe("Er produktet aktivt?"),
     }),
-    execute: async ({ productId, name, unitPrice, vatType, incomeAccount, active }) => {
+    execute: async ({ productId, name, unitPriceKr, vatType, incomeAccount, active }) => {
       try {
         const product = await client.updateProduct(productId, {
           name,
-          unitPrice,
+          unitPrice: unitPriceKr != null ? Math.round(unitPriceKr * 100) : undefined,
           vatType,
           incomeAccount,
           active: active ?? true,
@@ -395,14 +393,6 @@ export function createContactAgentTools(
   const attachmentTools = createAttachmentTools(client, pendingFiles);
 
   // ============================================
-  // DELEGATION TOOLS
-  // ============================================
-  
-  const delegationTools = onDelegate 
-    ? createDelegationToolsForAgent('contact_agent', onDelegate)
-    : {};
-
-  // ============================================
   // RETURN ALL TOOLS
   // ============================================
 
@@ -427,9 +417,6 @@ export function createContactAgentTools(
     
     // Attachments
     uploadAttachmentToContact: attachmentTools.uploadAttachmentToContact,
-    
-    // Delegation
-    ...delegationTools,
   };
 }
 

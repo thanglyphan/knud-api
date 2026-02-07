@@ -15,9 +15,7 @@ import type { FikenClient } from "../../client.js";
 import { 
   INVOICE_AGENT_PROMPT,
   createAttachmentTools,
-  createDelegationToolsForAgent,
   type PendingFile,
-  type DelegationHandler,
 } from "../shared/index.js";
 
 /**
@@ -27,7 +25,6 @@ export function createInvoiceAgentTools(
   client: FikenClient, 
   companySlug: string,
   pendingFiles?: PendingFile[],
-  onDelegate?: DelegationHandler
 ) {
   
   // ============================================
@@ -39,7 +36,7 @@ export function createInvoiceAgentTools(
     parameters: z.object({
       issueDateFrom: z.string().optional().describe("Fra utstedelsesdato (YYYY-MM-DD)"),
       issueDateTo: z.string().optional().describe("Til utstedelsesdato (YYYY-MM-DD)"),
-      customerId: z.number().optional().describe("Filtrer på kunde-ID"),
+      customerId: z.number().nullable().optional().describe("Filtrer på kunde-ID"),
       settled: z.boolean().optional().describe("Filtrer på betalt (true) eller ubetalt (false)"),
     }),
     execute: async ({ issueDateFrom, issueDateTo, customerId, settled }) => {
@@ -47,7 +44,7 @@ export function createInvoiceAgentTools(
         const invoices = await client.getInvoices({
           issueDateGe: issueDateFrom,
           issueDateLe: issueDateTo,
-          customerId,
+          customerId: customerId ?? undefined,
           settled,
           pageSize: 50,
         });
@@ -100,19 +97,19 @@ export function createInvoiceAgentTools(
   // ============================================
 
   const createInvoice = tool({
-    description: "Opprett en ny faktura i Fiken. PÅKREVD: issueDate, dueDate, lines, bankAccountCode, cash, customerId. Alle beløp i ØRE (100 = 1 kr). Hvis kunden ikke finnes, deleger til contact_agent.",
+    description: "Opprett en ny faktura i Fiken. PÅKREVD: issueDate, dueDate, lines, bankAccountCode, cash, customerId. Bruk searchContacts for å finne kundens contactId.",
     parameters: z.object({
-      customerId: z.number().describe("Kunde-ID (bruk delegateToContactAgent for å finne denne)"),
+      customerId: z.number().describe("Kunde-ID (contactId fra searchContacts)"),
       issueDate: z.string().describe("Fakturadato (YYYY-MM-DD)"),
       dueDate: z.string().describe("Forfallsdato (YYYY-MM-DD)"),
       lines: z.array(z.object({
         description: z.string().describe("Beskrivelse av vare/tjeneste"),
-        unitPrice: z.number().describe("Enhetspris i øre (100 = 1 kr, 50000 = 500 kr)"),
+        grossAmountKr: z.number().describe("Enhetspris i KRONER INKL. MVA. Bruker sier '5000 kr' → grossAmountKr = 5000. ALDRI konverter til øre!"),
         quantity: z.number().describe("Antall (påkrevd)"),
         vatType: z.string().optional().default("HIGH").describe("MVA-type: HIGH (25%), MEDIUM (15%), LOW (12%), NONE, EXEMPT, OUTSIDE"),
         incomeAccount: z.string().optional().default("3000").describe("Inntektskonto"),
       })).describe("Fakturalinjer"),
-      bankAccountCode: z.string().describe("Bankkonto for betaling (f.eks. '1920')"),
+      bankAccountCode: z.string().optional().default("1920").describe("Bankkontokode for betaling (standard: '1920'). System henter fullstendig kode automatisk."),
       cash: z.boolean().default(false).describe("Er dette kontantsalg? (true = betalt umiddelbart)"),
       invoiceText: z.string().optional().describe("Tekst på fakturaen"),
       ourReference: z.string().optional().describe("Vår referanse"),
@@ -120,18 +117,36 @@ export function createInvoiceAgentTools(
     }),
     execute: async ({ customerId, issueDate, dueDate, lines, bankAccountCode, cash, invoiceText, ourReference, yourReference }) => {
       try {
+        const vatRates: Record<string, number> = {
+          HIGH: 0.25, MEDIUM: 0.15, LOW: 0.12, RAW_FISH: 0.1111, NONE: 0, EXEMPT: 0, OUTSIDE: 0,
+        };
+        // Auto-resolve bankAccountCode: if user says "1920", find full code like "1920:10001"
+        let resolvedBankAccountCode = bankAccountCode || "1920";
+        if (resolvedBankAccountCode && !resolvedBankAccountCode.includes(":")) {
+          try {
+            const bankAccounts = await client.getBankAccounts();
+            const match = bankAccounts.find((ba: any) => ba.accountCode?.startsWith(resolvedBankAccountCode));
+            if (match?.accountCode) {
+              resolvedBankAccountCode = match.accountCode;
+            }
+          } catch { /* fallback to provided code */ }
+        }
         const invoice = await client.createInvoice({
           customerId,
           issueDate,
           dueDate,
-          lines: lines.map((line) => ({
-            description: line.description,
-            unitPrice: line.unitPrice,
-            quantity: line.quantity,
-            vatType: line.vatType || "HIGH",
-            incomeAccount: line.incomeAccount || "3000",
-          })),
-          bankAccountCode,
+          lines: lines.map((line) => {
+            const rate = vatRates[line.vatType || "HIGH"] ?? 0.25;
+            const netKr = line.grossAmountKr / (1 + rate);
+            return {
+              description: line.description,
+              unitPrice: Math.round(netKr * 100), // Convert net kr to øre
+              quantity: line.quantity,
+              vatType: line.vatType || "HIGH",
+              incomeAccount: line.incomeAccount || "3000",
+            };
+          }),
+          bankAccountCode: resolvedBankAccountCode,
           cash,
           invoiceText,
           ourReference,
@@ -226,11 +241,11 @@ export function createInvoiceAgentTools(
   const createInvoiceDraft = tool({
     description: "Opprett et fakturautkast som kan redigeres før det blir en faktura.",
     parameters: z.object({
-      customerId: z.number().describe("Kunde-ID"),
+      customerId: z.number().describe("Kunde-ID (contactId)"),
       daysUntilDueDate: z.number().describe("Antall dager til forfall"),
       lines: z.array(z.object({
         description: z.string().describe("Beskrivelse"),
-        unitPrice: z.number().describe("Enhetspris i øre"),
+        grossAmountKr: z.number().describe("Enhetspris i KRONER INKL. MVA. Bruker sier '5000 kr' → grossAmountKr = 5000. ALDRI konverter til øre!"),
         quantity: z.number().describe("Antall"),
         vatType: z.string().optional().default("HIGH"),
         incomeAccount: z.string().optional().default("3000"),
@@ -240,17 +255,24 @@ export function createInvoiceAgentTools(
     }),
     execute: async ({ customerId, daysUntilDueDate, lines, bankAccountCode, invoiceText }) => {
       try {
+        const vatRates: Record<string, number> = {
+          HIGH: 0.25, MEDIUM: 0.15, LOW: 0.12, RAW_FISH: 0.1111, NONE: 0, EXEMPT: 0, OUTSIDE: 0,
+        };
         const draft = await client.createInvoiceDraft({
           customerId,
           daysUntilDueDate,
           type: "invoice",
-          lines: lines.map((l) => ({
-            description: l.description,
-            unitPrice: l.unitPrice,
-            quantity: l.quantity,
-            vatType: l.vatType || "HIGH",
-            incomeAccount: l.incomeAccount || "3000",
-          })),
+          lines: lines.map((l) => {
+            const rate = vatRates[l.vatType || "HIGH"] ?? 0.25;
+            const netKr = l.grossAmountKr / (1 + rate);
+            return {
+              description: l.description,
+              unitPrice: Math.round(netKr * 100), // Convert net kr to øre
+              quantity: l.quantity,
+              vatType: l.vatType || "HIGH",
+              incomeAccount: l.incomeAccount || "3000",
+            };
+          }),
           bankAccountCode,
           invoiceText,
         });
@@ -269,50 +291,61 @@ export function createInvoiceAgentTools(
   });
 
   const createInvoiceFromDraft = tool({
-    description: "Opprett en faktura fra et eksisterende utkast.",
+    description: "Opprett en faktura fra et eksisterende utkast. BRUK ALLTID DETTE VERKTØYET når bruker ber om å lage faktura fra utkast. Verktøyet håndterer alt automatisk: henter utkastet, fyller inn manglende bankkonto/kontoinfo, og oppretter fakturaen. Du trenger IKKE hente utkastet først.",
     parameters: z.object({
       draftId: z.number().describe("Utkast-ID (heltall fra getInvoiceDrafts, IKKE uuid)"),
     }),
     execute: async ({ draftId }) => {
       try {
         const draft = await client.getInvoiceDraft(draftId);
-        const needsUpdate = draft.lines?.some((line) => !line.incomeAccount || !line.vatType);
-        const customerId = draft.customerId || (draft.customer as { contactId?: number })?.contactId;
+        
+        // Auto-resolve bank account number from first available bank account
+        let bankAccountNumber = (draft as any).bankAccountNumber;
+        if (!bankAccountNumber) {
+          try {
+            const bankAccounts = await client.getBankAccounts();
+            if (bankAccounts.length > 0) {
+              bankAccountNumber = (bankAccounts[0] as any).bankAccountNumber;
+            }
+          } catch { /* ignore, will fail later if truly needed */ }
+        }
+        
+        const customerId = draft.customerId || (draft.customer as { contactId?: number })?.contactId || 
+                          ((draft as any).customers as { contactId?: number }[])?.[0]?.contactId;
         const daysUntilDueDate = draft.daysUntilDueDate ?? 14;
         
-        if (needsUpdate) {
-          if (!customerId) {
-            return {
-              success: false,
-              error: "Kunne ikke finne kunde-ID på utkastet. Slett utkastet og opprett et nytt med kunde.",
-            };
-          }
-          
-          try {
-            await client.updateInvoiceDraft(draftId, {
-              customerId,
-              daysUntilDueDate,
-              type: draft.type === "cash_invoice" ? "cash_invoice" : "invoice",
-              lines: draft.lines?.map((line) => ({
-                description: line.description,
-                unitPrice: line.unitPrice,
-                quantity: line.quantity || 1,
-                vatType: line.vatType || "HIGH",
-                incomeAccount: line.incomeAccount || "3000",
-              })),
-              bankAccountCode: draft.bankAccountCode,
-              invoiceText: draft.invoiceText,
-              yourReference: draft.yourReference,
-              ourReference: draft.ourReference,
-              currency: draft.currency,
-              projectId: draft.projectId,
-            });
-          } catch (updateError) {
-            return {
-              success: false,
-              error: `Kunne ikke oppdatere utkast: ${updateError instanceof Error ? updateError.message : "Ukjent feil"}`,
-            };
-          }
+        // Always update draft to ensure all fields are present
+        if (!customerId) {
+          return {
+            success: false,
+            error: "Kunne ikke finne kunde-ID på utkastet. Slett utkastet og opprett et nytt med kunde.",
+          };
+        }
+        
+        try {
+          await client.updateInvoiceDraft(draftId, {
+            customerId,
+            daysUntilDueDate,
+            type: draft.type === "cash_invoice" ? "cash_invoice" : "invoice",
+            lines: draft.lines?.map((line) => ({
+              description: line.description,
+              unitPrice: line.unitPrice,
+              quantity: line.quantity || 1,
+              vatType: line.vatType || "HIGH",
+              incomeAccount: line.incomeAccount || "3000",
+            })),
+            bankAccountNumber,
+            invoiceText: draft.invoiceText,
+            yourReference: draft.yourReference,
+            ourReference: draft.ourReference,
+            currency: draft.currency,
+            projectId: draft.projectId,
+          });
+        } catch (updateError) {
+          return {
+            success: false,
+            error: `Kunne ikke oppdatere utkast: ${updateError instanceof Error ? updateError.message : "Ukjent feil"}`,
+          };
         }
         
         const invoice = await client.createInvoiceFromDraft(draftId);
@@ -439,7 +472,7 @@ export function createInvoiceAgentTools(
       issueDate: z.string().describe("Utstedelsesdato (YYYY-MM-DD)"),
       lines: z.array(z.object({
         description: z.string().optional().describe("Beskrivelse av det som krediteres"),
-        unitPrice: z.number().describe("Enhetspris i øre (positivt tall)"),
+        grossAmountKr: z.number().describe("Enhetspris i KRONER INKL. MVA (positivt tall). ALDRI konverter til øre!"),
         quantity: z.number().describe("Antall"),
         vatType: z.string().optional().default("HIGH"),
         incomeAccount: z.string().optional().default("3000"),
@@ -448,15 +481,22 @@ export function createInvoiceAgentTools(
     }),
     execute: async ({ invoiceId, customerId, issueDate, lines, creditNoteText }) => {
       try {
+        const vatRates: Record<string, number> = {
+          HIGH: 0.25, MEDIUM: 0.15, LOW: 0.12, RAW_FISH: 0.1111, NONE: 0, EXEMPT: 0, OUTSIDE: 0,
+        };
         const creditNote = await client.createPartialCreditNote({
           issueDate,
-          lines: lines.map((l) => ({
-            quantity: l.quantity,
-            unitPrice: l.unitPrice,
-            description: l.description,
-            vatType: l.vatType,
-            incomeAccount: l.incomeAccount,
-          })),
+          lines: lines.map((l) => {
+            const rate = vatRates[l.vatType || "HIGH"] ?? 0.25;
+            const netKr = l.grossAmountKr / (1 + rate);
+            return {
+              quantity: l.quantity,
+              unitPrice: Math.round(netKr * 100), // Convert net kr to øre
+              description: l.description,
+              vatType: l.vatType,
+              incomeAccount: l.incomeAccount,
+            };
+          }),
           creditNoteText,
           invoiceId,
           customerId,
@@ -569,8 +609,7 @@ export function createInvoiceAgentTools(
       currency: z.string().default("NOK").describe("Valuta"),
       lines: z.array(z.object({
         description: z.string().describe("Beskrivelse"),
-        netAmount: z.number().optional().describe("Nettobeløp i øre"),
-        grossAmount: z.number().optional().describe("Bruttobeløp i øre"),
+        grossAmountKr: z.number().describe("Bruttobeløp i KRONER inkl. MVA. Bruker sier '500 kr' → grossAmountKr = 500. ALDRI konverter til øre!"),
         vatType: z.string().default("HIGH").describe("MVA-type"),
         incomeAccount: z.string().default("3000").describe("Inntektskonto"),
       })),
@@ -581,18 +620,27 @@ export function createInvoiceAgentTools(
     }),
     execute: async ({ date, kind, paid, currency, lines, paymentAccount, paymentDate, contactId, projectId }) => {
       try {
+        // Convert kr to øre and calculate net from gross
+        const vatRates: Record<string, number> = {
+          "HIGH": 0.25, "MEDIUM": 0.15, "LOW": 0.12, "NONE": 0, "EXEMPT": 0, "OUTSIDE": 0,
+        };
         const sale = await client.createSale({
           date,
           kind,
           paid,
           currency,
-          lines: lines.map((l) => ({
-            description: l.description,
-            vatType: l.vatType,
-            netAmount: l.netAmount,
-            grossAmount: l.grossAmount,
-            incomeAccount: l.incomeAccount,
-          })),
+          lines: lines.map((l) => {
+            const grossOre = Math.round(l.grossAmountKr * 100);
+            const rate = vatRates[l.vatType] ?? 0;
+            const netOre = Math.round(grossOre / (1 + rate));
+            return {
+              description: l.description,
+              vatType: l.vatType,
+              netAmount: netOre,
+              grossAmount: grossOre,
+              incomeAccount: l.incomeAccount,
+            };
+          }),
           paymentAccount,
           paymentDate,
           contactId,
@@ -663,13 +711,27 @@ export function createInvoiceAgentTools(
     parameters: z.object({
       saleId: z.number().describe("Salg-ID"),
       date: z.string().describe("Betalingsdato (YYYY-MM-DD)"),
-      amount: z.number().describe("Beløp i øre"),
-      account: z.string().describe("Bankkonto"),
+      amountKr: z.number().describe("Beløp i KRONER. Eksempel: betaling på 500 kr → amountKr = 500. ALDRI konverter til øre!"),
+      account: z.string().optional().describe("Bankkonto-kode (f.eks. '1920:10001'). Standard: auto-hentes fra bankkonto."),
     }),
-    execute: async ({ saleId, date, amount, account }) => {
+    execute: async ({ saleId, date, amountKr, account }) => {
       try {
-        const payment = await client.addSalePayment(saleId, { date, amount, account });
-        return { success: true, message: "Betaling registrert på salg", payment };
+        const amountOre = Math.round(amountKr * 100);
+        // Auto-resolve bank account code if not provided or missing reskontro suffix
+        let resolvedAccount = account || "1920";
+        if (!resolvedAccount.includes(":")) {
+          try {
+            const bankAccounts = await client.getBankAccounts();
+            const match = bankAccounts.find((ba: any) => ba.accountCode?.startsWith(resolvedAccount + ":"));
+            if (match) {
+              resolvedAccount = match.accountCode;
+            }
+          } catch (e) {
+            // Fall back to provided account
+          }
+        }
+        const payment = await client.addSalePayment(saleId, { date, amount: amountOre, account: resolvedAccount });
+        return { success: true, message: `Betaling på ${amountKr} kr registrert på salg`, payment };
       } catch (error) {
         return {
           success: false,
@@ -770,18 +832,47 @@ export function createInvoiceAgentTools(
   });
 
   // ============================================
+  // CONTACT SEARCH (needed for invoice/sale creation)
+  // ============================================
+
+  const searchContacts = tool({
+    description: "Søk etter kunder/kontakter i Fiken. Bruk dette for å finne contactId når du skal opprette faktura eller salg.",
+    parameters: z.object({
+      name: z.string().optional().describe("Søk etter navn (delvis match)"),
+      customerNumber: z.number().optional().describe("Søk etter kundenummer"),
+    }),
+    execute: async ({ name, customerNumber }) => {
+      try {
+        const params: any = { pageSize: 20 };
+        if (name) params.name = name;
+        if (customerNumber) params.customerNumber = customerNumber;
+        const contacts = await client.getContacts(params);
+        const customers = contacts.filter((c) => c.customer);
+        return {
+          success: true,
+          count: customers.length,
+          contacts: customers.map((c) => ({
+            contactId: c.contactId,
+            name: c.name,
+            email: c.email,
+            customerNumber: c.customerNumber,
+            organizationNumber: c.organizationNumber,
+          })),
+        };
+      } catch (error) {
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : "Kunne ikke søke etter kontakter",
+        };
+      }
+    },
+  });
+
+  // ============================================
   // ATTACHMENT TOOLS (from shared module)
   // ============================================
   
   const attachmentTools = createAttachmentTools(client, pendingFiles);
-
-  // ============================================
-  // DELEGATION TOOLS (to other agents)
-  // ============================================
-  
-  const delegationTools = onDelegate 
-    ? createDelegationToolsForAgent('invoice_agent', onDelegate)
-    : {};
 
   // ============================================
   // RETURN ALL TOOLS
@@ -821,14 +912,14 @@ export function createInvoiceAgentTools(
     getCreditNoteCounter,
     initializeCreditNoteCounter,
     
+    // Contact search (for finding customer IDs)
+    searchContacts,
+    
     // Attachments
     uploadAttachmentToInvoice: attachmentTools.uploadAttachmentToInvoice,
     uploadAttachmentToSale: attachmentTools.uploadAttachmentToSale,
     uploadAttachmentToInvoiceDraft: attachmentTools.uploadAttachmentToInvoiceDraft,
     uploadAttachmentToCreditNoteDraft: attachmentTools.uploadAttachmentToCreditNoteDraft,
-    
-    // Delegation
-    ...delegationTools,
   };
 }
 

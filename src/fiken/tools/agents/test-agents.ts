@@ -20,7 +20,6 @@ import {
   ACCOUNTING_AGENT_PROMPT,
   ORCHESTRATOR_PROMPT,
   type FikenAgentType,
-  type DelegationRequest,
 } from "./index.js";
 
 // Mock FikenClient for testing
@@ -334,42 +333,28 @@ async function testAgentTools() {
   }
   
   // ============================================
-  // Test 7: Delegation Tools
+  // Test 7: Sub-agents have NO delegation tools (Bug 10 fix)
   // ============================================
-  log("\n7. Testing Delegation Tools", "blue");
+  log("\n7. Testing No Delegation Tools on Sub-agents", "blue");
   
   try {
-    const delegationHandler = async (request: DelegationRequest) => {
-      return {
-        success: true,
-        result: { delegatedTo: request.toAgent, task: request.task },
-        fromAgent: request.toAgent,
-      };
-    };
+    const invoiceTools = createInvoiceAgentTools(mockClient, companySlug, undefined);
     
-    const invoiceTools = createInvoiceAgentTools(mockClient, companySlug, undefined, delegationHandler);
-    
-    // Invoice agent should NOT have delegateToInvoiceAgent (can't delegate to self)
+    // Invoice agent should NOT have any delegation tools
     const hasSelfDelegation = 'delegateToInvoiceAgent' in invoiceTools;
     logTest("No self-delegation", !hasSelfDelegation, hasSelfDelegation ? "Has self-delegation (BAD)" : "Correctly excluded");
     if (!hasSelfDelegation) passed++; else failed++;
     
-    // Invoice agent SHOULD have delegation to other agents
+    // Invoice agent should NOT have delegation to other agents either (Bug 10 fix)
     const hasPurchaseDelegation = 'delegateToPurchaseAgent' in invoiceTools;
-    logTest("Has cross-agent delegation", hasPurchaseDelegation);
-    if (hasPurchaseDelegation) passed++; else failed++;
+    logTest("No cross-agent delegation (Bug 10 fix)", !hasPurchaseDelegation, hasPurchaseDelegation ? "Still has delegation tools (BAD)" : "Correctly removed");
+    if (!hasPurchaseDelegation) passed++; else failed++;
     
-    // Test actual delegation
-    if (hasPurchaseDelegation) {
-      const delegateResult = await (invoiceTools.delegateToPurchaseAgent as any).execute({
-        task: "Finn leverandør med navn 'Test'",
-        context: { query: "Test" },
-      });
-      logTest("Delegation execution", delegateResult.success === true);
-      if (delegateResult.success) passed++; else failed++;
-    }
+    const hasContactDelegation = 'delegateToContactAgent' in invoiceTools;
+    logTest("No contact delegation", !hasContactDelegation, hasContactDelegation ? "Still has delegation tools (BAD)" : "Correctly removed");
+    if (!hasContactDelegation) passed++; else failed++;
   } catch (e) {
-    logTest("Delegation Tools", false, String(e));
+    logTest("No Delegation Tools", false, String(e));
     failed++;
   }
   
