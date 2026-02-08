@@ -27,6 +27,44 @@ import type { ChatRequest } from "./types.js";
 
 dotenv.config();
 
+// Helper to truncate large tool results before saving to DB
+function truncateToolResult(result: unknown): unknown {
+  const str = JSON.stringify(result);
+  if (str.length <= 3000) return result;
+  
+  // For large results, keep a summary
+  try {
+    const parsed = typeof result === "object" && result !== null ? result : JSON.parse(str);
+    // If it's an array, keep first 3 items
+    if (Array.isArray(parsed)) {
+      return {
+        _truncated: true,
+        _totalItems: parsed.length,
+        items: parsed.slice(0, 3),
+      };
+    }
+    // If it has known summary fields, keep those
+    if (typeof parsed === "object") {
+      const summary: Record<string, unknown> = {};
+      const keepKeys = ["id", "invoiceId", "purchaseId", "contactId", "offerId", "draftId", 
+                        "invoiceNumber", "identifier", "name", "status", "totalAmount",
+                        "success", "error", "_operationComplete", "fileUploaded",
+                        "grossAmount", "netAmount", "amount", "date", "dueDate",
+                        "customer", "supplier", "description"];
+      for (const key of keepKeys) {
+        if (key in parsed) summary[key] = parsed[key as keyof typeof parsed];
+      }
+      if (Object.keys(summary).length > 0) {
+        return { _truncated: true, ...summary };
+      }
+    }
+  } catch {
+    // Fall through to string truncation
+  }
+  
+  return { _truncated: true, _preview: str.substring(0, 500) };
+}
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 
@@ -224,6 +262,9 @@ app.post("/api/chat", requireAuth, requireAccountingConnection, async (req, res)
         
         // Include conversation history (simplified to text only)
         for (const msg of processedMessages) {
+          // Skip tool result messages — they don't have useful text for sub-agents
+          if (msg.role === "tool") continue;
+          
           const content = typeof msg.content === "string" 
             ? msg.content 
             : Array.isArray(msg.content)
@@ -351,18 +392,64 @@ IKKE spør brukeren om å sende fil${files.length > 1 ? 'ene' : 'en'} på nytt -
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
 
-    // Process messages - add file info and images to user message if files are attached
+    // Process messages - reconstruct CoreMessage[] from DB records
+    // Messages with toolData need to be converted back to proper format
     type MessageContent = 
       | string 
-      | Array<{ type: "text"; text: string } | { type: "image"; image: string }>;
+      | Array<{ type: "text"; text: string } | { type: "image"; image: string } | { type: "tool-call"; toolCallId: string; toolName: string; args: unknown }>;
+    
+    type ToolResultContent = Array<{ type: "tool-result"; toolCallId: string; toolName: string; result: unknown }>;
     
     let processedMessages: Array<{
-      role: "user" | "assistant";
-      content: MessageContent;
-    }> = messages.map((msg) => ({
-      role: msg.role as "user" | "assistant",
-      content: msg.content,
-    }));
+      role: "user" | "assistant" | "tool";
+      content: MessageContent | ToolResultContent;
+    }> = [];
+    
+    for (const msg of messages) {
+      const td = msg.toolData as Record<string, unknown> | undefined;
+      
+      if (msg.role === "tool" && td?.toolResults) {
+        // Reconstruct tool result message
+        const toolResults = td.toolResults as Array<{ toolCallId: string; toolName: string; result: unknown }>;
+        processedMessages.push({
+          role: "tool",
+          content: toolResults.map(tr => ({
+            type: "tool-result" as const,
+            toolCallId: tr.toolCallId,
+            toolName: tr.toolName,
+            result: tr.result,
+          })),
+        });
+      } else if (msg.role === "assistant" && td?.toolCalls) {
+        // Reconstruct assistant message with tool calls
+        const toolCalls = td.toolCalls as Array<{ toolCallId: string; toolName: string; args: unknown }>;
+        const parts: Array<{ type: "text"; text: string } | { type: "tool-call"; toolCallId: string; toolName: string; args: unknown }> = [];
+        
+        if (msg.content.trim()) {
+          parts.push({ type: "text", text: msg.content });
+        }
+        for (const tc of toolCalls) {
+          parts.push({
+            type: "tool-call",
+            toolCallId: tc.toolCallId,
+            toolName: tc.toolName,
+            args: tc.args,
+          });
+        }
+        
+        processedMessages.push({
+          role: "assistant",
+          content: parts,
+        });
+      } else if (msg.role === "user" || msg.role === "assistant") {
+        // Regular text message
+        processedMessages.push({
+          role: msg.role as "user" | "assistant",
+          content: msg.content,
+        });
+      }
+      // Skip any other roles (system, etc.)
+    }
 
     // If files are attached, convert to vision format for AI to "see" the content
     if (files && files.length > 0) {
@@ -499,47 +586,103 @@ MEN spør om bankmatch og betalt/ubetalt status.]`;
     const reader = stream.getReader();
     const decoder = new TextDecoder();
 
-    let fullResponse = "";
-
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       
       const chunk = decoder.decode(value, { stream: true });
       res.write(chunk);
-
-      // Extract text content from the stream for saving to DB
-      const lines = chunk.split("\n").filter(Boolean);
-      for (const line of lines) {
-        const match = line.match(/^0:"(.*)"/);
-        if (match) {
-          const content = match[1]
-            .replace(/\\n/g, "\n")
-            .replace(/\\"/g, '"')
-            .replace(/\\\\/g, "\\");
-          fullResponse += content;
-        }
-      }
     }
 
-    // Save assistant response to database if chatId is provided
-    if (chatId && fullResponse) {
+    // After streaming completes, get the full response messages
+    // This includes assistant messages (with tool calls) and tool result messages
+    if (chatId) {
       try {
-        await prisma.message.create({
-          data: {
-            chatId,
-            role: "assistant",
-            content: fullResponse,
-          },
-        });
+        const responseData = await result.response;
+        const responseMessages = responseData.messages || [];
         
-        // Update chat timestamp
-        await prisma.chat.update({
-          where: { id: chatId },
-          data: { updatedAt: new Date() },
-        });
+        const dbMessages: Array<{ chatId: string; role: string; content: string; toolData?: unknown }> = [];
+        
+        for (const msg of responseMessages) {
+          if (msg.role === "assistant") {
+            if (typeof msg.content === "string") {
+              // Plain text assistant message
+              if (msg.content.trim()) {
+                dbMessages.push({
+                  chatId,
+                  role: "assistant",
+                  content: msg.content,
+                });
+              }
+            } else if (Array.isArray(msg.content)) {
+              // Mixed content: text parts + tool call parts
+              const textParts = msg.content
+                .filter((p: { type: string }) => p.type === "text")
+                .map((p: { type: string; text?: string }) => p.text || "")
+                .join("");
+              const toolCallParts = msg.content
+                .filter((p: { type: string }) => p.type === "tool-call")
+                .map((p: { type: string; toolCallId?: string; toolName?: string; args?: unknown }) => ({
+                  toolCallId: p.toolCallId,
+                  toolName: p.toolName,
+                  args: p.args,
+                }));
+              
+              if (toolCallParts.length > 0) {
+                dbMessages.push({
+                  chatId,
+                  role: "assistant",
+                  content: textParts || "",
+                  toolData: { toolCalls: toolCallParts },
+                });
+              } else if (textParts.trim()) {
+                dbMessages.push({
+                  chatId,
+                  role: "assistant",
+                  content: textParts,
+                });
+              }
+            }
+          } else if (msg.role === "tool") {
+            // Tool result message
+            if (Array.isArray(msg.content)) {
+              const toolResults = msg.content.map((p: { type: string; toolCallId?: string; toolName?: string; result?: unknown }) => ({
+                toolCallId: p.toolCallId,
+                toolName: p.toolName,
+                // Truncate large results to keep DB size manageable
+                result: truncateToolResult(p.result),
+              }));
+              
+              dbMessages.push({
+                chatId,
+                role: "tool",
+                content: "", // Tool messages don't have text content
+                toolData: { toolResults },
+              });
+            }
+          }
+        }
+        
+        if (dbMessages.length > 0) {
+          await prisma.message.createMany({
+            data: dbMessages.map(m => ({
+              chatId: m.chatId,
+              role: m.role,
+              content: m.content,
+              toolData: m.toolData ?? undefined,
+            })),
+          });
+          
+          // Update chat timestamp
+          await prisma.chat.update({
+            where: { id: chatId },
+            data: { updatedAt: new Date() },
+          });
+          
+          console.log(`[DB] Saved ${dbMessages.length} response messages (${dbMessages.filter(m => m.toolData).length} with tool data)`);
+        }
       } catch (dbError) {
-        console.error("Failed to save assistant message to DB:", dbError);
+        console.error("Failed to save response messages to DB:", dbError);
       }
     }
 

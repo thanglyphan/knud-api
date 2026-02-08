@@ -78,8 +78,9 @@ model Chat {
 
 model Message {
   id        String   @id @default(uuid())
-  role      String   // "user" | "assistant"
+  role      String   // "user" | "assistant" | "tool"
   content   String
+  toolData  Json?    // Tool call/result metadata for multi-turn context
   createdAt DateTime @default(now())
   chat      Chat     @relation(fields: [chatId], references: [id], onDelete: Cascade)
   chatId    String

@@ -143,7 +143,7 @@ router.delete("/:id", async (req, res) => {
 router.post("/:id/messages", async (req, res) => {
   try {
     const { id } = req.params;
-    const { role, content } = req.body;
+    const { role, content, toolData } = req.body;
     const userId = req.userId!;
 
     if (!role || !content) {
@@ -166,6 +166,7 @@ router.post("/:id/messages", async (req, res) => {
         chatId: id,
         role,
         content,
+        toolData: toolData || undefined,
       },
     });
 
@@ -205,10 +206,11 @@ router.post("/:id/messages/batch", async (req, res) => {
     }
 
     const createdMessages = await prisma.message.createMany({
-      data: messages.map((msg: { role: string; content: string }) => ({
+      data: messages.map((msg: { role: string; content: string; toolData?: unknown }) => ({
         chatId: id,
         role: msg.role,
         content: msg.content,
+        toolData: msg.toolData || undefined,
       })),
     });
 
