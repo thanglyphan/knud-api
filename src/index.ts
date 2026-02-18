@@ -13,6 +13,7 @@ import subscribeRoutes from "./routes/subscribe.js";
 import { requireAuth, requireAccountingConnection } from "./middleware/auth.js";
 import { createFikenClient } from "./fiken/client.js";
 import { createFikenTools } from "./fiken/tools/index.js";
+import { createAttachmentTools } from "./fiken/tools/shared/attachments.js";
 import { 
   createFikenAgentSystem,
   ORCHESTRATOR_PROMPT,
@@ -258,23 +259,47 @@ app.post("/api/chat", requireAuth, requireAccountingConnection, async (req, res)
         
         // Build messages array with conversation history + delegation task
         // This gives the sub-agent full context of what the user has said
-        const agentMessages: Array<{ role: "user" | "assistant"; content: string }> = [];
+        const agentMessages: Array<{
+          role: "user" | "assistant";
+          content: string | Array<{ type: "text"; text: string } | { type: "image"; image: string }>;
+        }> = [];
         
-        // Include conversation history (simplified to text only)
+        // Include conversation history — pass through image content parts
+        // so sub-agents can also "see" attached files via Vision
         for (const msg of processedMessages) {
           // Skip tool result messages — they don't have useful text for sub-agents
           if (msg.role === "tool") continue;
           
-          const content = typeof msg.content === "string" 
-            ? msg.content 
-            : Array.isArray(msg.content)
-              ? msg.content.filter((p: { type: string }) => p.type === "text").map((p: { type: string; text?: string }) => p.text || "").join("\n")
-              : String(msg.content);
-          if (content.trim()) {
-            agentMessages.push({
-              role: msg.role as "user" | "assistant",
-              content,
-            });
+          if (typeof msg.content === "string") {
+            if (msg.content.trim()) {
+              agentMessages.push({
+                role: msg.role as "user" | "assistant",
+                content: msg.content,
+              });
+            }
+          } else if (Array.isArray(msg.content)) {
+            // Multi-part content (text + images from Vision)
+            // Pass through ALL parts including images so sub-agents can see files
+            const parts = (msg.content as Array<{ type: string; text?: string; image?: string }>)
+              .filter((p) => p.type === "text" || p.type === "image")
+              .map((p) => {
+                if (p.type === "image") return { type: "image" as const, image: p.image! };
+                return { type: "text" as const, text: p.text || "" };
+              });
+            if (parts.length > 0) {
+              agentMessages.push({
+                role: msg.role as "user" | "assistant",
+                content: parts,
+              });
+            }
+          } else {
+            const content = String(msg.content);
+            if (content.trim()) {
+              agentMessages.push({
+                role: msg.role as "user" | "assistant",
+                content,
+              });
+            }
           }
         }
         
@@ -296,7 +321,7 @@ Bruk denne datoen som referanse for alle datoer.
 ## KONTEKST FRA ORCHESTRATOR
 Du ble delegert en oppgave av hovedagenten. Du har tilgang til hele samtalehistorikken for kontekst.
 Bruk informasjon fra tidligere meldinger for å fullføre oppgaven.`,
-            messages: agentMessages,
+            messages: agentMessages as Parameters<typeof generateText>[0]["messages"],
             tools: agentTools as Parameters<typeof generateText>[0]["tools"],
             maxSteps: 15,
             toolChoice: "auto",
@@ -316,15 +341,55 @@ Bruk informasjon fra tidligere meldinger for å fullføre oppgaven.`,
           // or that files were uploaded — propagate both to the orchestrator result
           const completedOps: string[] = [];
           let filesUploaded = false;
+          let createdEntityId: number | undefined;
+          let createdEntityType: string | undefined;
           for (const step of (agentResult as any).steps || []) {
             for (const result of step.toolResults || []) {
               const r = result.result as Record<string, unknown> | undefined;
               if (r && r._operationComplete) {
                 completedOps.push(result.toolName as string);
+                // Track the created entity for auto-upload safety net
+                if (result.toolName === 'createPurchase' && r.purchase && (r.purchase as any).purchaseId) {
+                  createdEntityId = (r.purchase as any).purchaseId;
+                  createdEntityType = 'purchase';
+                } else if (result.toolName === 'createSale' && r.sale && (r.sale as any).saleId) {
+                  createdEntityId = (r.sale as any).saleId;
+                  createdEntityType = 'sale';
+                } else if (result.toolName === 'createInvoice' && r.invoice && (r.invoice as any).invoiceId) {
+                  createdEntityId = (r.invoice as any).invoiceId;
+                  createdEntityType = 'invoice';
+                }
               }
               if (r && r.fileUploaded) {
                 filesUploaded = true;
               }
+            }
+          }
+          
+          // Safety net: if files were attached but the agent didn't upload them,
+          // auto-upload after a create operation completed successfully
+          if (!filesUploaded && createdEntityId && createdEntityType && files && files.length > 0) {
+            console.log(`[Agent:${agentType}] Safety net: auto-uploading ${files.length} file(s) to ${createdEntityType} ${createdEntityId}`);
+            try {
+              const attachTools = createAttachmentTools(fikenClient, files.map(f => ({ name: f.name, type: f.type, data: f.data })));
+              
+              let uploadResult: any;
+              if (createdEntityType === 'purchase') {
+                uploadResult = await (attachTools.uploadAttachmentToPurchase as any).execute({ purchaseId: createdEntityId });
+              } else if (createdEntityType === 'sale') {
+                uploadResult = await (attachTools.uploadAttachmentToSale as any).execute({ saleId: createdEntityId });
+              } else if (createdEntityType === 'invoice') {
+                uploadResult = await (attachTools.uploadAttachmentToInvoice as any).execute({ invoiceId: createdEntityId });
+              }
+              
+              if (uploadResult?.fileUploaded) {
+                filesUploaded = true;
+                console.log(`[Agent:${agentType}] Safety net: files uploaded successfully`);
+              } else {
+                console.log(`[Agent:${agentType}] Safety net: upload result:`, uploadResult);
+              }
+            } catch (uploadError) {
+              console.error(`[Agent:${agentType}] Safety net upload failed:`, uploadError);
             }
           }
           
@@ -378,12 +443,16 @@ Bruk denne datoen som referanse for alle datoer (f.eks. "i dag", "denne måneden
 Brukeren har vedlagt følgende fil${files.length > 1 ? 'er' : ''} til DENNE meldingen:
 ${fileList}
 
+⚠️ **FILNAVN ER IKKE PÅLITELIGE!** Filnavnet sier INGENTING om hva filen faktisk inneholder.
+"faktura-microsoft-50000kr.pdf" kan inneholde en Rema 1000-kvittering. ALDRI trekk ut leverandør, beløp eller annen info fra filnavnet.
+
 **DU MÅ SØRGE FOR AT ${files.length > 1 ? 'ALLE FILENE' : 'FILEN'} BLIR LASTET OPP!**
 Deleger HELE oppgaven (opprettelse + filopplasting) til riktig agent i ÉN ENKELT delegering.
 Agenten har verktøy for å både opprette (createPurchase, createSale, etc.) og laste opp vedlegg (uploadAttachmentToPurchase, etc.).
 ⚠️ VIKTIG: IKKE deleger to ganger (én for opprettelse, én for opplasting) - det vil opprette duplikater!
 
-IKKE spør brukeren om å sende fil${files.length > 1 ? 'ene' : 'en'} på nytt - ${files.length > 1 ? 'filene ER' : 'filen ER'} allerede vedlagt og klar${files.length > 1 ? 'e' : ''} til opplasting!`;
+IKKE spør brukeren om å sende fil${files.length > 1 ? 'ene' : 'en'} på nytt - ${files.length > 1 ? 'filene ER' : 'filen ER'} allerede vedlagt og klar${files.length > 1 ? 'e' : ''} til opplasting!
+La sub-agenten lese bildet/PDF-en selv — IKKE oppsummer filinnholdet basert på filnavnet.`;
       }
     }
 
@@ -490,8 +559,8 @@ IKKE spør brukeren om å sende fil${files.length > 1 ? 'ene' : 'en'} på nytt -
           // Provider-specific file instructions
           let fileInstructions: string;
           if (provider === "fiken") {
-            // Fiken: Ask user about accounts, bank accounts, etc.
-            fileInstructions = `[ANALYSER ALLE vedlagte bilder/filer. Hvis FLERE kvitteringer/fakturaer: 1) Les av info fra HVER fil separat 2) Presenter ALLE i nummerert oversikt (Fil 1, Fil 2, osv.) 3) Sjekk om noen filer ser ut til å være SAMME kvittering - spør brukeren! 4) Spør om alle skal registreres som separate kjøp 5) La brukeren velge om alle skal ha samme konto. For HVER fil: Identifiser leverandør, dato, beløp, MVA, beskrivelse, betalingsstatus. ⛔ IKKE spør om inkl/ekskl MVA hvis du ser MVA-info! 📌 ALLTID spør hvilken bankkonto for betalte kjøp!]`;
+            // Fiken: Delegate to sub-agent which reads images directly
+            fileInstructions = `[VEDLAGTE BILDER/FILER: Deleger til purchase_agent og la agenten lese bildene SELV. ALDRI trekk ut leverandør, beløp eller annen info fra FILNAVNET — filnavn er upålitelige! Hvis brukerens tekst påstår en annen leverandør/beløp enn det som vises i bildet, STOL PÅ BILDET. Si til sub-agenten: "Les vedlagte bilder/filer og identifiser leverandør, beløp, dato, MVA osv. direkte fra bildene."]`;
           } else if (provider === "tripletex") {
             // Tripletex: Smart bank reconciliation + automatic processing
             fileInstructions = `[ANALYSER ALLE ${files.length} vedlagte kvitteringer GRUNDIG.

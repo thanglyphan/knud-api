@@ -51,6 +51,8 @@ export interface DelegationResponse {
   result?: unknown;
   error?: string;
   fromAgent: FikenAgentType;
+  /** Set to true when files were uploaded to Fiken — frontend uses this to clear pending files */
+  fileUploaded?: boolean;
 }
 
 /**
@@ -89,6 +91,7 @@ export function createDelegationTools(
           result: response.result,
           error: response.error,
           delegatedTo: 'invoice_agent',
+          ...(response.fileUploaded && { fileUploaded: true }),
         };
       } catch (error) {
         return {
@@ -119,6 +122,7 @@ export function createDelegationTools(
           result: response.result,
           error: response.error,
           delegatedTo: 'purchase_agent',
+          ...(response.fileUploaded && { fileUploaded: true }),
         };
       } catch (error) {
         return {
@@ -149,6 +153,7 @@ export function createDelegationTools(
           result: response.result,
           error: response.error,
           delegatedTo: 'contact_agent',
+          ...(response.fileUploaded && { fileUploaded: true }),
         };
       } catch (error) {
         return {
@@ -179,6 +184,7 @@ export function createDelegationTools(
           result: response.result,
           error: response.error,
           delegatedTo: 'offer_agent',
+          ...(response.fileUploaded && { fileUploaded: true }),
         };
       } catch (error) {
         return {
@@ -209,6 +215,7 @@ export function createDelegationTools(
           result: response.result,
           error: response.error,
           delegatedTo: 'bank_agent',
+          ...(response.fileUploaded && { fileUploaded: true }),
         };
       } catch (error) {
         return {
@@ -239,6 +246,7 @@ export function createDelegationTools(
           result: response.result,
           error: response.error,
           delegatedTo: 'accounting_agent',
+          ...(response.fileUploaded && { fileUploaded: true }),
         };
       } catch (error) {
         return {

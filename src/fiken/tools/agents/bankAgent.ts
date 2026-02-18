@@ -279,12 +279,23 @@ Søker etter transaksjoner på bankkontoer (1920-serien) innenfor dato-range og 
           };
         }
         
-        // 3. Hent journal entries (bilag) i perioden
-        const journalEntries = await client.getJournalEntries({
-          dateGe: dateFromStr,
-          dateLe: dateToStr,
-          pageSize: 100,
-        });
+        // 3. Hent journal entries (bilag) i perioden — with pagination
+        let allJournalEntries: any[] = [];
+        let page = 0;
+        const pageSize = 100;
+        while (true) {
+          const entries = await client.getJournalEntries({
+            dateGe: dateFromStr,
+            dateLe: dateToStr,
+            pageSize,
+            page,
+          });
+          allJournalEntries = allJournalEntries.concat(entries);
+          if (entries.length < pageSize) break; // Last page
+          page++;
+          if (page > 10) break; // Safety limit: max 1100 entries
+        }
+        const journalEntries = allJournalEntries;
         
         // 4. Konverter beløp til øre og finn margin (5 kr = 500 øre)
         const amountInOre = amount * 100;
@@ -306,7 +317,10 @@ Søker etter transaksjoner på bankkontoer (1920-serien) innenfor dato-range og 
           
           for (const line of entry.lines) {
             // Sjekk om linjen er på en bankkonto (starter med 19)
-            const account = line.debitAccount || line.creditAccount;
+            // NOTE: Fiken API returns "account" (readOnly) on GET responses,
+            // NOT "debitAccount"/"creditAccount" (writeOnly, used only on POST).
+            // The "account" field format is "1920:10001" (accountCode:subAccount)
+            const account = (line as any).account || line.debitAccount || line.creditAccount;
             if (!account || !account.startsWith("19")) continue;
             
             const lineAmount = line.amount || 0;
