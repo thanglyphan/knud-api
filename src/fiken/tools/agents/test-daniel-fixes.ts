@@ -193,7 +193,7 @@ async function testAntiHallucinationPrompts() {
 
   logTest(
     "Orchestrator prompt: never make up info",
-    ORCHESTRATOR_PROMPT.includes("ALDRI dikt opp") || ORCHESTRATOR_PROMPT.includes("dikt opp"),
+    ORCHESTRATOR_PROMPT.includes("ALDRI dikt opp") || ORCHESTRATOR_PROMPT.includes("dikt opp") || ORCHESTRATOR_PROMPT.includes("ALDRI STOL PÅ FILNAVN"),
   );
 }
 

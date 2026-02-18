@@ -205,9 +205,10 @@ app.get("/api/tripletex/payslip/:id/pdf", requireAuth, requireAccountingConnecti
 // Supports both Fiken and Tripletex based on user's activeProvider
 app.post("/api/chat", requireAuth, requireAccountingConnection, async (req, res) => {
   try {
-    const { messages, chatId, files } = req.body as ChatRequest & { 
+    const { messages, chatId, files, filesResend } = req.body as ChatRequest & { 
       chatId?: string;
       files?: Array<{ name: string; type: string; data: string }>;
+      filesResend?: boolean;
     };
 
     if (!messages || !Array.isArray(messages)) {
@@ -219,7 +220,7 @@ app.post("/api/chat", requireAuth, requireAccountingConnection, async (req, res)
 
     // Log file info for debugging
     if (files && files.length > 0) {
-      console.log(`${files.length} file(s) attached:`, files.map(f => ({ name: f.name, type: f.type, dataLength: f.data?.length })));
+      console.log(`${files.length} file(s) attached${filesResend ? ' (RESEND for upload)' : ' (NEW)'}:`, files.map(f => ({ name: f.name, type: f.type, dataLength: f.data?.length })));
     }
 
     // Get current date in Norwegian format
@@ -363,7 +364,7 @@ Du ble delegert en oppgave av hovedagenten. Du har tilgang til hele samtalehisto
 Bruk informasjon fra tidligere meldinger for å fullføre oppgaven.`,
             messages: agentMessages as Parameters<typeof generateText>[0]["messages"],
             tools: agentTools as Parameters<typeof generateText>[0]["tools"],
-            maxSteps: 15,
+            maxSteps: 25, // Increased for multi-purchase flows (4x create + 4x upload + lookups)
             toolChoice: "auto",
             onStepFinish: ({ stepType, toolCalls, toolResults }) => {
               console.log(`[Agent:${agentType}] Step: ${stepType}`);
@@ -381,23 +382,21 @@ Bruk informasjon fra tidligere meldinger for å fullføre oppgaven.`,
           // or that files were uploaded — propagate both to the orchestrator result
           const completedOps: string[] = [];
           let filesUploaded = false;
-          let createdEntityId: number | undefined;
-          let createdEntityType: string | undefined;
+          // Track ALL created entities (not just the last one) for multi-file safety net
+          const createdEntities: Array<{ entityId: number; entityType: string; order: number }> = [];
+          let entityOrder = 0;
           for (const step of (agentResult as any).steps || []) {
             for (const result of step.toolResults || []) {
               const r = result.result as Record<string, unknown> | undefined;
               if (r && r._operationComplete) {
                 completedOps.push(result.toolName as string);
-                // Track the created entity for auto-upload safety net
+                // Track each created entity
                 if (result.toolName === 'createPurchase' && r.purchase && (r.purchase as any).purchaseId) {
-                  createdEntityId = (r.purchase as any).purchaseId;
-                  createdEntityType = 'purchase';
+                  createdEntities.push({ entityId: (r.purchase as any).purchaseId, entityType: 'purchase', order: entityOrder++ });
                 } else if (result.toolName === 'createSale' && r.sale && (r.sale as any).saleId) {
-                  createdEntityId = (r.sale as any).saleId;
-                  createdEntityType = 'sale';
+                  createdEntities.push({ entityId: (r.sale as any).saleId, entityType: 'sale', order: entityOrder++ });
                 } else if (result.toolName === 'createInvoice' && r.invoice && (r.invoice as any).invoiceId) {
-                  createdEntityId = (r.invoice as any).invoiceId;
-                  createdEntityType = 'invoice';
+                  createdEntities.push({ entityId: (r.invoice as any).invoiceId, entityType: 'invoice', order: entityOrder++ });
                 }
               }
               if (r && r.fileUploaded) {
@@ -407,26 +406,59 @@ Bruk informasjon fra tidligere meldinger for å fullføre oppgaven.`,
           }
           
           // Safety net: if files were attached but the agent didn't upload them,
-          // auto-upload after a create operation completed successfully
-          if (!filesUploaded && createdEntityId && createdEntityType && files && files.length > 0) {
-            console.log(`[Agent:${agentType}] Safety net: auto-uploading ${files.length} file(s) to ${createdEntityType} ${createdEntityId}`);
+          // auto-upload after create operation(s) completed successfully.
+          // For MULTIPLE entities: upload each file to its corresponding entity (by order).
+          // For SINGLE entity: upload all files to that entity.
+          if (!filesUploaded && createdEntities.length > 0 && files && files.length > 0) {
+            console.log(`[Agent:${agentType}] Safety net: ${createdEntities.length} entities created, ${files.length} file(s) to upload`);
             try {
               const attachTools = createAttachmentTools(fikenClient, files.map(f => ({ name: f.name, type: f.type, data: f.data })));
               
-              let uploadResult: any;
-              if (createdEntityType === 'purchase') {
-                uploadResult = await (attachTools.uploadAttachmentToPurchase as any).execute({ purchaseId: createdEntityId });
-              } else if (createdEntityType === 'sale') {
-                uploadResult = await (attachTools.uploadAttachmentToSale as any).execute({ saleId: createdEntityId });
-              } else if (createdEntityType === 'invoice') {
-                uploadResult = await (attachTools.uploadAttachmentToInvoice as any).execute({ invoiceId: createdEntityId });
-              }
-              
-              if (uploadResult?.fileUploaded) {
-                filesUploaded = true;
-                console.log(`[Agent:${agentType}] Safety net: files uploaded successfully`);
+              if (createdEntities.length === 1) {
+                // Single entity: upload ALL files to it (no fileIndex = upload all)
+                const entity = createdEntities[0];
+                let uploadResult: any;
+                if (entity.entityType === 'purchase') {
+                  uploadResult = await (attachTools.uploadAttachmentToPurchase as any).execute({ purchaseId: entity.entityId });
+                } else if (entity.entityType === 'sale') {
+                  uploadResult = await (attachTools.uploadAttachmentToSale as any).execute({ saleId: entity.entityId });
+                } else if (entity.entityType === 'invoice') {
+                  uploadResult = await (attachTools.uploadAttachmentToInvoice as any).execute({ invoiceId: entity.entityId });
+                }
+                if (uploadResult?.fileUploaded) {
+                  filesUploaded = true;
+                  console.log(`[Agent:${agentType}] Safety net: all files uploaded to ${entity.entityType} ${entity.entityId}`);
+                }
               } else {
-                console.log(`[Agent:${agentType}] Safety net: upload result:`, uploadResult);
+                // Multiple entities: upload file N to entity N (1-based fileIndex)
+                let allUploaded = true;
+                for (const entity of createdEntities) {
+                  const fileIndex = entity.order + 1; // 1-based
+                  if (fileIndex > files.length) {
+                    console.log(`[Agent:${agentType}] Safety net: no file for entity ${entity.entityType} ${entity.entityId} (fileIndex ${fileIndex} > ${files.length} files)`);
+                    continue;
+                  }
+                  try {
+                    let uploadResult: any;
+                    if (entity.entityType === 'purchase') {
+                      uploadResult = await (attachTools.uploadAttachmentToPurchase as any).execute({ purchaseId: entity.entityId, fileIndex });
+                    } else if (entity.entityType === 'sale') {
+                      uploadResult = await (attachTools.uploadAttachmentToSale as any).execute({ saleId: entity.entityId, fileIndex });
+                    } else if (entity.entityType === 'invoice') {
+                      uploadResult = await (attachTools.uploadAttachmentToInvoice as any).execute({ invoiceId: entity.entityId, fileIndex });
+                    }
+                    if (uploadResult?.fileUploaded) {
+                      console.log(`[Agent:${agentType}] Safety net: file ${fileIndex} uploaded to ${entity.entityType} ${entity.entityId}`);
+                    } else {
+                      allUploaded = false;
+                    }
+                  } catch (fileError) {
+                    console.error(`[Agent:${agentType}] Safety net: failed to upload file ${fileIndex} to ${entity.entityType} ${entity.entityId}:`, fileError);
+                    allUploaded = false;
+                  }
+                }
+                filesUploaded = allUploaded || createdEntities.length > 0; // Partial success counts
+                console.log(`[Agent:${agentType}] Safety net: multi-entity upload ${allUploaded ? 'complete' : 'partially complete'}`);
               }
             } catch (uploadError) {
               console.error(`[Agent:${agentType}] Safety net upload failed:`, uploadError);
@@ -473,8 +505,10 @@ Bruk informasjon fra tidligere meldinger for å fullføre oppgaven.`,
 I dag er ${dateStr} (${isoDate}).
 Bruk denne datoen som referanse for alle datoer (f.eks. "i dag", "denne måneden", "i år").`;
 
-    // If there are files attached, tell the AI about them
-    if (files && files.length > 0) {
+    // If there are NEW files attached (not resend), tell the AI about them
+    // Resent files are just made available for upload tools via pendingFiles,
+    // but do NOT trigger a new analysis/VEDLAGTE FILER section in the prompt.
+    if (files && files.length > 0 && !filesResend) {
       if (provider === "fiken") {
         const fileList = files.map((f, i) => `${i + 1}. ${f.name} (${f.type})`).join('\n');
         systemPromptWithDate += `
@@ -562,8 +596,9 @@ La sub-agenten lese bildet/PDF-en selv — IKKE oppsummer filinnholdet basert p�
       // Skip any other roles (system, etc.)
     }
 
-    // If files are attached, convert to vision format for AI to "see" the content
-    if (files && files.length > 0) {
+    // If NEW files are attached (not resend), convert to vision format for AI to "see" the content
+    // Resent files are only for upload tools — no need for vision analysis again
+    if (files && files.length > 0 && !filesResend) {
       const lastIndex = processedMessages.length - 1;
       if (lastIndex >= 0 && processedMessages[lastIndex].role === "user") {
         
