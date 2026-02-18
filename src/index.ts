@@ -265,10 +265,50 @@ app.post("/api/chat", requireAuth, requireAccountingConnection, async (req, res)
         }> = [];
         
         // Include conversation history — pass through image content parts
-        // so sub-agents can also "see" attached files via Vision
+        // so sub-agents can also "see" attached files via Vision.
+        // ALSO include tool result messages so sub-agents know what was already
+        // created (purchaseId, invoiceId, etc.) and can act on follow-up requests.
         for (const msg of processedMessages) {
-          // Skip tool result messages — they don't have useful text for sub-agents
-          if (msg.role === "tool") continue;
+          if (msg.role === "tool") {
+            // Convert tool results to a text summary for the sub-agent.
+            // Sub-agents don't have the same tool definitions, so we can't
+            // pass raw tool-result content. Instead, summarize as assistant text.
+            if (Array.isArray(msg.content)) {
+              const summaryParts = (msg.content as Array<{ type: string; toolName?: string; result?: unknown }>)
+                .filter(p => p.type === "tool-result")
+                .map(p => {
+                  const r = p.result as Record<string, unknown> | undefined;
+                  if (!r) return null;
+                  // Extract key info from tool results
+                  const info: string[] = [];
+                  if (p.toolName) info.push(`Verktøy: ${p.toolName}`);
+                  if (r.success) info.push("Status: Fullført");
+                  if (r.message) info.push(`Resultat: ${r.message}`);
+                  if (r.purchaseId || (r.purchase as any)?.purchaseId) {
+                    info.push(`purchaseId: ${r.purchaseId || (r.purchase as any)?.purchaseId}`);
+                  }
+                  if (r.invoiceId || (r.invoice as any)?.invoiceId) {
+                    info.push(`invoiceId: ${r.invoiceId || (r.invoice as any)?.invoiceId}`);
+                  }
+                  if (r.saleId || (r.sale as any)?.saleId) {
+                    info.push(`saleId: ${r.saleId || (r.sale as any)?.saleId}`);
+                  }
+                  if (r.contactId) info.push(`contactId: ${r.contactId}`);
+                  if (r.fileUploaded) info.push("Fil lastet opp: ja");
+                  if (r._operationComplete) info.push("Operasjon fullført");
+                  return info.length > 0 ? info.join(", ") : null;
+                })
+                .filter(Boolean);
+              
+              if (summaryParts.length > 0) {
+                agentMessages.push({
+                  role: "assistant",
+                  content: `[Tidligere verktøyresultat: ${summaryParts.join(" | ")}]`,
+                });
+              }
+            }
+            continue;
+          }
           
           if (typeof msg.content === "string") {
             if (msg.content.trim()) {
@@ -446,8 +486,10 @@ ${fileList}
 ⚠️ **FILNAVN ER IKKE PÅLITELIGE!** Filnavnet sier INGENTING om hva filen faktisk inneholder.
 "faktura-microsoft-50000kr.pdf" kan inneholde en Rema 1000-kvittering. ALDRI trekk ut leverandør, beløp eller annen info fra filnavnet.
 
-**DU MÅ SØRGE FOR AT ${files.length > 1 ? 'ALLE FILENE' : 'FILEN'} BLIR LASTET OPP!**
-Deleger HELE oppgaven (opprettelse + filopplasting) til riktig agent i ÉN ENKELT delegering.
+**SJEKK FØRST:** Ble det nylig opprettet et kjøp/faktura/salg i denne samtalen som mangler vedlegg?
+- Hvis JA → Deleger til riktig agent med: "Last opp vedlagt fil til [type] med ID [X] ved å kalle uploadAttachmentTo[Type]. IKKE opprett noe nytt."
+- Hvis NEI → Deleger HELE oppgaven (opprettelse + filopplasting) til riktig agent i ÉN ENKELT delegering.
+
 Agenten har verktøy for å både opprette (createPurchase, createSale, etc.) og laste opp vedlegg (uploadAttachmentToPurchase, etc.).
 ⚠️ VIKTIG: IKKE deleger to ganger (én for opprettelse, én for opplasting) - det vil opprette duplikater!
 

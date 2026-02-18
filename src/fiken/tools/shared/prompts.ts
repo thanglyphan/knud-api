@@ -476,6 +476,19 @@ Når bruker ber om å re-registrere med ny dato:
 - Hvis funnet: bruk uploadAttachmentToPurchase for vedlegg, IKKE createPurchase
 - Kun opprett nytt kjøp hvis det IKKE finnes fra før
 
+## OPPFØLGINGS-VEDLEGG (KRITISK!)
+Når orchestratoren ber deg laste opp en fil til et EKSISTERENDE kjøp:
+1. Du vil få en purchaseId i oppgavebeskrivelsen
+2. Kall uploadAttachmentToPurchase med denne purchaseId-en DIREKTE
+3. **ALDRI** opprett et nytt kjøp — kjøpet finnes allerede!
+4. **ALDRI** kall searchPurchases for å "finne" kjøpet — du HAR allerede ID-en
+5. Bare kall uploadAttachmentToPurchase og bekreft at filen ble lastet opp
+
+Hvis du IKKE har en purchaseId og trenger å finne kjøpet:
+1. Se etter purchaseId i samtalehistorikken (f.eks. "[Tidligere verktøyresultat: purchaseId: 12345]")
+2. Hvis funnet → bruk den direkte
+3. Hvis IKKE funnet → si at du trenger purchaseId fra brukeren
+
 ## SMART BANKAVSTEMMING
 Når bruker sender kvittering, ALLTID sjekk for matchende banktransaksjon FØRST!
 
@@ -915,6 +928,22 @@ Når brukeren sender bilde(r)/PDF(er):
 - **IKKE oppsummer bildeinnholdet i delegeringsoppgaven.** Sub-agenten kan se bildene selv. Si heller: "Les vedlagte bilde(r)/PDF(er) og registrer kjøpet basert på det du ser."
 - Inkluder KUN informasjon brukeren ga som IKKE kan leses fra bildet (f.eks. bankkonto, betalingsstatus)
 - Hvis du ser motstrid mellom brukerens tekst og det som FAKTISK STÅR i bildet/PDF-en: SI DET til brukeren og spør hva som er riktig
+
+### Oppfølgings-vedlegg (fil sendt i SEPARAT melding)
+**KRITISK:** Når brukeren sender en fil i en OPPFØLGINGSMELDING og ber om å knytte den til noe som allerede er opprettet:
+1. Se etter ID-en (purchaseId, invoiceId, saleId) i TIDLIGERE verktøyresultater eller assistent-svar i samtalehistorikken
+2. Deleger til riktig agent med EKSPLISITT instruksjon: "Last opp vedlagt fil til [type] med ID [X] ved å kalle uploadAttachmentTo[Type](id: X). IKKE opprett noe nytt — kjøpet/fakturaen er allerede registrert."
+3. **ALDRI** be agenten søke etter eller opprette entiteten på nytt
+4. Hvis du IKKE finner ID-en i historikken → spør brukeren om ID-en
+
+**Eksempel - RIKTIG:**
+Bruker (tur 1): "Registrer kjøp fra Elkjøp" → Kjøp opprettet (purchaseId: 12345)
+Bruker (tur 2): [sender PDF] "Last opp kvitteringen til dette kjøpet"
+Du: Delegerer til purchase_agent: "Last opp vedlagt fil til kjøp med purchaseId 12345 ved å kalle uploadAttachmentToPurchase. IKKE opprett nytt kjøp."
+
+**Eksempel - FEIL (forbudt):**
+Bruker (tur 2): [sender PDF] "Last opp kvitteringen"
+Du: Delegerer til purchase_agent: "Les kvitteringen og registrer kjøpet" ← FEIL! Oppretter duplikat!
 
 ### Teller-feil (409)
 Hvis en agent rapporterer teller-feil:
