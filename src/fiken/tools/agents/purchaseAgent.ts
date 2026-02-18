@@ -280,12 +280,16 @@ SMART BANKKONTO-LOGIKK:
           };
         });
         
-        const newTotalNet = convertedLines.reduce((sum, l) => sum + l.netPrice, 0);
-        
         // ============================================
         // DUPLICATE CHECK: Search for existing purchases
         // on the same date with similar amount/description
+        // Uses GROSS amount comparison (net+vat) to catch
+        // duplicates even when VAT types differ between attempts
         // ============================================
+        
+        const newTotalGross = convertedLines.reduce((sum, l) => sum + l.netPrice + l.vat, 0);
+        
+        console.log(`[createPurchase] Duplicate check: date=${date}, gross=${newTotalGross} øre, supplierId=${supplierId || 'none'}, desc="${lines[0]?.description || ''}"`);
         
         try {
           const existingPurchases = await client.getPurchases({
@@ -298,11 +302,13 @@ SMART BANKKONTO-LOGIKK:
           const duplicates = existingPurchases.filter((p) => {
             if (!p.lines || p.lines.length === 0) return false;
             
-            // Calculate existing purchase total net
-            const existingTotalNet = p.lines.reduce((sum, l) => sum + (l.netPrice || 0), 0);
+            // Calculate existing purchase total gross (net + vat)
+            const existingTotalGross = p.lines.reduce((sum, l) => sum + (l.netPrice || 0) + (l.vat || 0), 0);
             
-            // Check if amounts match (within 1 kr / 100 øre margin for rounding)
-            const amountMatch = Math.abs(existingTotalNet - newTotalNet) < 100;
+            // Check if gross amounts match (within 1 kr / 100 øre margin for rounding)
+            const amountMatch = Math.abs(existingTotalGross - newTotalGross) < 100;
+            
+            if (!amountMatch) return false; // Skip early if amounts don't match
             
             // Check if description is similar (case-insensitive substring match)
             const newDesc = lines[0]?.description?.toLowerCase() || "";
@@ -313,11 +319,21 @@ SMART BANKKONTO-LOGIKK:
               newDesc === existingDesc
             );
             
-            // Check supplier match
-            const supplierMatch = supplierId && p.supplierId && supplierId === p.supplierId;
+            // Check supplier match (Fiken returns supplier as Contact object, not supplierId)
+            const existingSupplierId = p.supplierId || p.supplier?.contactId;
+            const supplierMatch = supplierId && existingSupplierId && supplierId === existingSupplierId;
             
-            // A duplicate if amount matches AND (description or supplier matches)
-            return amountMatch && (descMatch || supplierMatch);
+            // For kontantkjøp without supplier: amount match alone is sufficient
+            // (there's no supplier to disambiguate, so same amount = likely duplicate)
+            const kontantAmountOnly = !supplierId && !existingSupplierId;
+            
+            const isDuplicate = descMatch || supplierMatch || kontantAmountOnly;
+            
+            if (isDuplicate) {
+              console.log(`[createPurchase] DUPLICATE FOUND: existing #${p.purchaseId} (${existingTotalGross} øre, desc="${existingDesc}", supplier=${existingSupplierId || 'none'}) matches new (${newTotalGross} øre, desc="${newDesc}", supplier=${supplierId || 'none'}) — reason: ${descMatch ? 'desc' : supplierMatch ? 'supplier' : 'kontant-amount'}`);
+            }
+            
+            return isDuplicate;
           });
           
           if (duplicates.length > 0) {

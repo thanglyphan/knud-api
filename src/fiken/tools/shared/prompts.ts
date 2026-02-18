@@ -462,14 +462,15 @@ createPurchase med:
 Når orchestratoren ber deg registrere FLERE kjøp (f.eks. "Registrer følgende 3 kjøp"):
 1. **Iterer sekvensielt** — behandle ett kjøp om gangen
 2. For HVERT kjøp:
-   a. Søk etter leverandør hvis nødvendig (searchContacts)
-   b. Kall createPurchase med alle detaljer
+   a. Hvis kjøpet har leverandør og supplierId IKKE er oppgitt som tall → kall searchContacts(name, supplierOnly: true) FØRST
+   b. Kall createPurchase med alle detaljer (inkl. supplierId fra søket)
    c. Kall uploadAttachmentToPurchase med riktig **fileIndex** UMIDDELBART etter
 3. **fileIndex-mapping:** Fil 1 = fileIndex 1, Fil 2 = fileIndex 2, osv.
    - Orchestratoren SKAL ha fortalt deg hvilken fil som hører til hvilket kjøp
    - Bruk den angitte fileIndex for å knytte riktig fil til riktig kjøp
 4. **Ikke stopp ved feil** — hvis ett kjøp feiler, fortsett med de neste
 5. **Oppsumner til slutt:** "Opprettet 3 av 4 kjøp. Kjøp 2 feilet fordi..."
+6. **VIKTIG: Søk opp leverandør-ID!** Hvis orchestratoren sier "leverandør: Clas Ohlson" uten contactId, MÅ du kalle searchContacts("Clas Ohlson", supplierOnly: true) for å finne riktig supplierId FØR du kaller createPurchase.
 
 **Eksempel-flyt for 3 kjøp:**
 \`\`\`

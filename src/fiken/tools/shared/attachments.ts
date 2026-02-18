@@ -127,6 +127,15 @@ export function createAttachmentTools(client: FikenClient, pendingFiles?: Pendin
           };
         }
         
+        // Check existing attachments to avoid duplicates
+        let existingAttachmentCount = 0;
+        try {
+          const existing = await client.getPurchaseAttachments(purchaseId);
+          existingAttachmentCount = existing.length;
+        } catch {
+          // If we can't check, proceed anyway
+        }
+        
         const uploadFn = (formData: FormData) => client.addAttachmentToPurchase(purchaseId, formData);
         const formDataOptions = { attachToSale: true };
         
@@ -141,6 +150,20 @@ export function createAttachmentTools(client: FikenClient, pendingFiles?: Pendin
           }
           
           const file = pendingFiles[arrayIndex];
+          
+          // Skip if purchase already has attachments (avoid duplicates on retry)
+          if (existingAttachmentCount > 0) {
+            return {
+              success: true,
+              fileUploaded: true,
+              filesUploaded: 0,
+              totalFiles: pendingFiles.length,
+              fileIndex: fileIndex,
+              message: `Kjøp ${purchaseId} har allerede ${existingAttachmentCount} vedlegg — hopper over (duplikatbeskyttelse)`,
+              skipped: true,
+            };
+          }
+          
           try {
             const result = await uploadSingleFile(file, uploadFn, formDataOptions);
             return {
@@ -160,7 +183,18 @@ export function createAttachmentTools(client: FikenClient, pendingFiles?: Pendin
           }
         }
         
-        // Upload all files
+        // Upload all files (skip if purchase already has attachments)
+        if (existingAttachmentCount > 0) {
+          return {
+            success: true,
+            fileUploaded: true,
+            filesUploaded: 0,
+            totalFiles: pendingFiles.length,
+            message: `Kjøp ${purchaseId} har allerede ${existingAttachmentCount} vedlegg — ingen nye opplastinger (duplikatbeskyttelse)`,
+            skipped: true,
+          };
+        }
+        
         const { uploaded, errors } = await uploadMultipleFiles(pendingFiles, uploadFn, formDataOptions);
         
         if (uploaded.length === 0) {

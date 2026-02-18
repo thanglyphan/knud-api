@@ -345,9 +345,13 @@ app.post("/api/chat", requireAuth, requireAccountingConnection, async (req, res)
         }
         
         // Add the delegation task as final user message
+        // Include file availability info so sub-agents know to upload attachments
+        const fileReminder = files && files.length > 0
+          ? `\n\n[FILER TILGJENGELIG: ${files.map((f, i) => `Fil ${i + 1}: ${f.name}`).join(', ')}. Bruk uploadAttachmentToPurchase/uploadAttachmentToSale/uploadAttachmentToInvoice med riktig fileIndex etter opprettelse. fileIndex er 1-basert.]`
+          : '';
         agentMessages.push({
           role: "user",
-          content: `[Delegert oppgave fra orchestrator]: ${request.task}${request.context ? `\n\nKontekst: ${JSON.stringify(request.context)}` : ""}`,
+          content: `[Delegert oppgave fra orchestrator]: ${request.task}${request.context ? `\n\nKontekst: ${JSON.stringify(request.context)}` : ""}${fileReminder}`,
         });
         
         try {
@@ -407,59 +411,103 @@ Bruk informasjon fra tidligere meldinger for å fullføre oppgaven.`,
           
           // Safety net: if files were attached but the agent didn't upload them,
           // auto-upload after create operation(s) completed successfully.
-          // For MULTIPLE entities: upload each file to its corresponding entity (by order).
-          // For SINGLE entity: upload all files to that entity.
+          // IMPORTANT: Each entity gets exactly ONE file based on its order position.
+          // The duplicate check in uploadAttachmentToPurchase (attachments.ts) will
+          // skip uploads if the purchase already has attachments.
           if (!filesUploaded && createdEntities.length > 0 && files && files.length > 0) {
-            console.log(`[Agent:${agentType}] Safety net: ${createdEntities.length} entities created, ${files.length} file(s) to upload`);
+            console.log(`[Agent:${agentType}] Safety net: ${createdEntities.length} entities created, ${files.length} file(s) available`);
             try {
               const attachTools = createAttachmentTools(fikenClient, files.map(f => ({ name: f.name, type: f.type, data: f.data })));
               
-              if (createdEntities.length === 1) {
-                // Single entity: upload ALL files to it (no fileIndex = upload all)
-                const entity = createdEntities[0];
-                let uploadResult: any;
-                if (entity.entityType === 'purchase') {
-                  uploadResult = await (attachTools.uploadAttachmentToPurchase as any).execute({ purchaseId: entity.entityId });
-                } else if (entity.entityType === 'sale') {
-                  uploadResult = await (attachTools.uploadAttachmentToSale as any).execute({ saleId: entity.entityId });
-                } else if (entity.entityType === 'invoice') {
-                  uploadResult = await (attachTools.uploadAttachmentToInvoice as any).execute({ invoiceId: entity.entityId });
-                }
-                if (uploadResult?.fileUploaded) {
-                  filesUploaded = true;
-                  console.log(`[Agent:${agentType}] Safety net: all files uploaded to ${entity.entityType} ${entity.entityId}`);
-                }
-              } else {
-                // Multiple entities: upload file N to entity N (1-based fileIndex)
-                let allUploaded = true;
-                for (const entity of createdEntities) {
-                  const fileIndex = entity.order + 1; // 1-based
-                  if (fileIndex > files.length) {
-                    console.log(`[Agent:${agentType}] Safety net: no file for entity ${entity.entityType} ${entity.entityId} (fileIndex ${fileIndex} > ${files.length} files)`);
-                    continue;
+              // Determine which file to upload for each entity.
+              // The entity's "order" tells us which file index it corresponds to.
+              // In the common single-entity case (one purchase per delegation round),
+              // we need to figure out the correct fileIndex from context.
+              // 
+              // Strategy: Look at the delegation task message for a file reference.
+              // If the task mentions "Fil X" or "file X", use that index.
+              // Otherwise, use entity.order + 1 (which works for batch creates).
+              // If there's only 1 entity and we can't determine the file, try to find
+              // a fileIndex hint from the agent's text response.
+              let allUploaded = true;
+              
+              for (const entity of createdEntities) {
+                // Try to determine correct fileIndex for this entity
+                let fileIndex: number | undefined;
+                
+                // Strategy 1: Check the delegation task text for "Fil X" reference.
+                // This is most reliable because the orchestrator explicitly states which file.
+                // For multi-purchase tasks like "Kjøp 1 (Fil 2): ..." we need to find
+                // the file reference that corresponds to this entity's order.
+                const taskMsg = request?.task || '';
+                
+                if (createdEntities.length > 1) {
+                  // Multiple entities in one delegation: find all "Fil N" references and map by order
+                  const allFileRefs = [...String(taskMsg).matchAll(/[Ff]il\s+(\d+)/g)];
+                  if (allFileRefs.length > entity.order) {
+                    const refIndex = parseInt(allFileRefs[entity.order][1], 10);
+                    if (refIndex >= 1 && refIndex <= files.length) {
+                      fileIndex = refIndex;
+                    }
                   }
-                  try {
-                    let uploadResult: any;
-                    if (entity.entityType === 'purchase') {
-                      uploadResult = await (attachTools.uploadAttachmentToPurchase as any).execute({ purchaseId: entity.entityId, fileIndex });
-                    } else if (entity.entityType === 'sale') {
-                      uploadResult = await (attachTools.uploadAttachmentToSale as any).execute({ saleId: entity.entityId, fileIndex });
-                    } else if (entity.entityType === 'invoice') {
-                      uploadResult = await (attachTools.uploadAttachmentToInvoice as any).execute({ invoiceId: entity.entityId, fileIndex });
+                } else {
+                  // Single entity: find first "Fil N" reference in task
+                  const taskFileMatch = String(taskMsg).match(/[Ff]il\s+(\d+)/);
+                  if (taskFileMatch) {
+                    const refIndex = parseInt(taskFileMatch[1], 10);
+                    if (refIndex >= 1 && refIndex <= files.length) {
+                      fileIndex = refIndex;
                     }
-                    if (uploadResult?.fileUploaded) {
-                      console.log(`[Agent:${agentType}] Safety net: file ${fileIndex} uploaded to ${entity.entityType} ${entity.entityId}`);
-                    } else {
-                      allUploaded = false;
+                  }
+                }
+                
+                // Strategy 2: Check the agent's response text for "Fil X" reference
+                if (!fileIndex) {
+                  const fileRefMatch = agentResult.text.match(/[Ff]il\s+(\d+)/);
+                  if (fileRefMatch) {
+                    const refIndex = parseInt(fileRefMatch[1], 10);
+                    if (refIndex >= 1 && refIndex <= files.length) {
+                      fileIndex = refIndex;
                     }
-                  } catch (fileError) {
-                    console.error(`[Agent:${agentType}] Safety net: failed to upload file ${fileIndex} to ${entity.entityType} ${entity.entityId}:`, fileError);
+                  }
+                }
+                
+                // Fallback: use entity order + 1 (works for batch creates)
+                if (!fileIndex) {
+                  fileIndex = entity.order + 1;
+                  // Clamp to valid range
+                  if (fileIndex > files.length) {
+                    fileIndex = files.length; // Use last file if order exceeds count
+                  }
+                }
+                
+                console.log(`[Agent:${agentType}] Safety net: uploading file ${fileIndex} to ${entity.entityType} ${entity.entityId}`);
+                
+                try {
+                  let uploadResult: any;
+                  if (entity.entityType === 'purchase') {
+                    uploadResult = await (attachTools.uploadAttachmentToPurchase as any).execute({ purchaseId: entity.entityId, fileIndex });
+                  } else if (entity.entityType === 'sale') {
+                    uploadResult = await (attachTools.uploadAttachmentToSale as any).execute({ saleId: entity.entityId, fileIndex });
+                  } else if (entity.entityType === 'invoice') {
+                    uploadResult = await (attachTools.uploadAttachmentToInvoice as any).execute({ invoiceId: entity.entityId, fileIndex });
+                  }
+                  
+                  if (uploadResult?.skipped) {
+                    console.log(`[Agent:${agentType}] Safety net: skipped (already has attachments) for ${entity.entityType} ${entity.entityId}`);
+                  } else if (uploadResult?.fileUploaded) {
+                    console.log(`[Agent:${agentType}] Safety net: file ${fileIndex} uploaded to ${entity.entityType} ${entity.entityId}`);
+                  } else {
                     allUploaded = false;
                   }
+                } catch (fileError) {
+                  console.error(`[Agent:${agentType}] Safety net: failed to upload file ${fileIndex} to ${entity.entityType} ${entity.entityId}:`, fileError);
+                  allUploaded = false;
                 }
-                filesUploaded = allUploaded || createdEntities.length > 0; // Partial success counts
-                console.log(`[Agent:${agentType}] Safety net: multi-entity upload ${allUploaded ? 'complete' : 'partially complete'}`);
               }
+              
+              filesUploaded = allUploaded || createdEntities.length > 0; // Partial success counts
+              console.log(`[Agent:${agentType}] Safety net: upload ${allUploaded ? 'complete' : 'partially complete'}`);
             } catch (uploadError) {
               console.error(`[Agent:${agentType}] Safety net upload failed:`, uploadError);
             }
@@ -505,9 +553,21 @@ Bruk informasjon fra tidligere meldinger for å fullføre oppgaven.`,
 I dag er ${dateStr} (${isoDate}).
 Bruk denne datoen som referanse for alle datoer (f.eks. "i dag", "denne måneden", "i år").`;
 
-    // If there are NEW files attached (not resend), tell the AI about them
-    // Resent files are just made available for upload tools via pendingFiles,
-    // but do NOT trigger a new analysis/VEDLAGTE FILER section in the prompt.
+    // If there are files attached, tell the AI about them.
+    // For NEW files: full analysis prompt (VEDLAGTE FILER).
+    // For RESENT files: lighter reminder that files are available for upload.
+    if (files && files.length > 0 && filesResend && provider === "fiken") {
+      const fileList = files.map((f, i) => `${i + 1}. ${f.name} (${f.type})`).join('\n');
+      systemPromptWithDate += `
+
+## FILER TILGJENGELIG FOR OPPLASTING (${files.length} stk)
+Følgende filer er fortsatt tilgjengelig for opplasting via uploadAttachment-verktøy:
+${fileList}
+
+Disse filene ble allerede analysert tidligere i samtalen — IKKE analyser dem på nytt.
+MEN: Hvis du oppretter nye kjøp/salg/fakturaer, HUSK å be sub-agenten laste opp riktig fil (fileIndex) til hvert opprettet dokument.
+fileIndex-mapping: Fil 1 = fileIndex 1, Fil 2 = fileIndex 2, osv.`;
+    }
     if (files && files.length > 0 && !filesResend) {
       if (provider === "fiken") {
         const fileList = files.map((f, i) => `${i + 1}. ${f.name} (${f.type})`).join('\n');
