@@ -347,7 +347,7 @@ app.post("/api/chat", requireAuth, requireAccountingConnection, async (req, res)
         // Add the delegation task as final user message
         // Include file availability info so sub-agents know to upload attachments
         const fileReminder = files && files.length > 0
-          ? `\n\n[FILER TILGJENGELIG: ${files.map((f, i) => `Fil ${i + 1}: ${f.name}`).join(', ')}. Bruk uploadAttachmentToPurchase/uploadAttachmentToSale/uploadAttachmentToInvoice med riktig fileIndex etter opprettelse. fileIndex er 1-basert.]`
+          ? `\n\n[FILER TILGJENGELIG: ${files.map((f, i) => `Fil ${i + 1}: ${f.name}`).join(', ')}. Bruk uploadAttachment-verktøyet (uploadAttachmentToPurchase/uploadAttachmentToSale/uploadAttachmentToInvoice/uploadAttachmentToJournalEntry) med riktig fileIndex etter opprettelse. fileIndex er 1-basert.]`
           : '';
         agentMessages.push({
           role: "user",

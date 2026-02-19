@@ -615,8 +615,8 @@ export function createInvoiceAgentTools(
       })),
       paymentAccount: z.string().optional().describe("Bankkonto for betaling"),
       paymentDate: z.string().optional().describe("Betalingsdato"),
-      contactId: z.number().optional().describe("Kunde-ID hvis relevant"),
-      projectId: z.number().optional().describe("Prosjekt-ID"),
+      contactId: z.number().nullable().optional().describe("Kunde-ID hvis relevant"),
+      projectId: z.number().nullable().optional().describe("Prosjekt-ID"),
     }),
     execute: async ({ date, kind, paid, currency, lines, paymentAccount, paymentDate, contactId, projectId }) => {
       try {
@@ -624,28 +624,40 @@ export function createInvoiceAgentTools(
         const vatRates: Record<string, number> = {
           "HIGH": 0.25, "MEDIUM": 0.15, "LOW": 0.12, "NONE": 0, "EXEMPT": 0, "OUTSIDE": 0,
         };
-        const sale = await client.createSale({
+        const convertedLines = lines.map((l) => {
+          const grossOre = Math.round(l.grossAmountKr * 100);
+          const rate = vatRates[l.vatType] ?? 0;
+          const netOre = Math.round(grossOre / (1 + rate));
+          const vatOre = grossOre - netOre;
+          return {
+            description: l.description,
+            vatType: l.vatType,
+            netPrice: netOre,
+            vat: vatOre, // REQUIRED — Fiken does NOT auto-calculate VAT on sales
+            incomeAccount: l.incomeAccount,
+            _grossOre: grossOre, // keep for totalPaid calculation only
+          };
+        });
+        // Auto-calculate totalPaid when paid=true (Fiken requires this for NOK sales)
+        const totalPaidOre = paid
+          ? convertedLines.reduce((sum, l) => sum + l._grossOre, 0)
+          : undefined;
+        // Strip internal _grossOre before sending to Fiken
+        const fikenLines = convertedLines.map(({ _grossOre, ...rest }) => rest);
+        const salePayload = {
           date,
           kind,
           paid,
           currency,
-          lines: lines.map((l) => {
-            const grossOre = Math.round(l.grossAmountKr * 100);
-            const rate = vatRates[l.vatType] ?? 0;
-            const netOre = Math.round(grossOre / (1 + rate));
-            return {
-              description: l.description,
-              vatType: l.vatType,
-              netAmount: netOre,
-              grossAmount: grossOre,
-              incomeAccount: l.incomeAccount,
-            };
-          }),
+          lines: fikenLines,
+          totalPaid: totalPaidOre,
           paymentAccount,
-          paymentDate,
-          contactId,
-          projectId,
-        });
+          paymentDate: paymentDate ?? (paymentAccount ? date : undefined),
+          contactId: contactId ?? undefined,
+          projectId: projectId ?? undefined,
+        };
+        console.log(`[createSale] Payload:`, JSON.stringify(salePayload, null, 2));
+        const sale = await client.createSale(salePayload);
         return {
           success: true,
           _operationComplete: true,

@@ -63,7 +63,7 @@ export function createAgentConfigs(config: OrchestratorConfig): Record<FikenAgen
       prompt: OFFER_AGENT_PROMPT,
     },
     bank_agent: {
-      tools: createBankAgentTools(client, companySlug),
+      tools: createBankAgentTools(client, companySlug, pendingFiles),
       prompt: BANK_AGENT_PROMPT,
     },
     accounting_agent: {
@@ -114,7 +114,7 @@ export function getAgentTools(
     case 'offer_agent':
       return createOfferAgentTools(client, companySlug, pendingFiles);
     case 'bank_agent':
-      return createBankAgentTools(client, companySlug);
+      return createBankAgentTools(client, companySlug, pendingFiles);
     case 'accounting_agent':
       return createAccountingAgentTools(client, companySlug, pendingFiles);
   }
@@ -185,7 +185,7 @@ export function createFikenAgentSystem(config: OrchestratorConfig) {
         prompt: OFFER_AGENT_PROMPT,
       },
       bank_agent: {
-        tools: createBankAgentTools(client, companySlug),
+        tools: createBankAgentTools(client, companySlug, pendingFiles),
         prompt: BANK_AGENT_PROMPT,
       },
       accounting_agent: {

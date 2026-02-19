@@ -14,6 +14,8 @@ import { tool } from "ai";
 import type { FikenClient } from "../../client.js";
 import { 
   BANK_AGENT_PROMPT,
+  createAttachmentTools,
+  type PendingFile,
 } from "../shared/index.js";
 
 /**
@@ -22,6 +24,7 @@ import {
 export function createBankAgentTools(
   client: FikenClient, 
   companySlug: string,
+  pendingFiles?: PendingFile[],
 ) {
   
   // ============================================
@@ -427,6 +430,203 @@ Søker etter transaksjoner på bankkontoer (1920-serien) innenfor dato-range og 
   });
 
   // ============================================
+  // BANK RECONCILIATION (Bankavstemming)
+  // ============================================
+
+  const reconcileBankStatement = tool({
+    description: `Avstem kontoutskrift mot bokførte transaksjoner.
+Tar strukturerte transaksjoner fra et kontoutdrag (som du har lest med Vision) og matcher dem mot bokførte journal entries i Fiken.
+Returnerer oversikt over matchede (allerede bokført) og umatchede (trenger bokføring) transaksjoner.
+
+VIKTIG: Du MÅ først lese kontoutskriften med Vision og ekstrahere alle transaksjoner til strukturert format FØR du kaller dette verktøyet.
+Beløp skal være i KR (ikke øre). Negative beløp = utgifter/ut. Positive beløp = inntekter/inn.`,
+    parameters: z.object({
+      bankAccountCode: z.string().describe("Bankkonto-kode fra getBankAccounts (f.eks. '1920:10001')"),
+      periodFrom: z.string().describe("Periodens start (YYYY-MM-DD)"),
+      periodTo: z.string().describe("Periodens slutt (YYYY-MM-DD)"),
+      transactions: z.array(z.object({
+        date: z.string().describe("Transaksjonsdato (YYYY-MM-DD)"),
+        amount: z.number().describe("Beløp i KR (negativ = ut, positiv = inn)"),
+        description: z.string().describe("Beskrivelse fra kontoutdraget"),
+      })).describe("Transaksjoner ekstrahert fra kontoutskriften"),
+    }),
+    execute: async ({ bankAccountCode, periodFrom, periodTo, transactions }) => {
+      try {
+        // 1. Hent alle journal entries for perioden (paginert)
+        let allJournalEntries: any[] = [];
+        let page = 0;
+        const pageSize = 100;
+        while (true) {
+          const entries = await client.getJournalEntries({
+            dateGe: periodFrom,
+            dateLe: periodTo,
+            pageSize,
+            page,
+          });
+          allJournalEntries = allJournalEntries.concat(entries);
+          if (entries.length < pageSize) break;
+          page++;
+          if (page > 10) break; // Safety limit: max 1100 entries
+        }
+
+        // 2. Filtrer journal entry lines som er på den angitte bankkontoen
+        const bookedBankEntries: Array<{
+          journalEntryId: number;
+          transactionId?: number;
+          date: string;
+          amount: number; // i øre
+          amountKr: number;
+          description: string;
+          matched: boolean;
+        }> = [];
+
+        for (const entry of allJournalEntries) {
+          if (!entry.lines || !entry.journalEntryId) continue;
+
+          for (const line of entry.lines) {
+            // Fiken API returns "account" (readOnly) on GET responses
+            const account = (line as any).account || line.debitAccount || line.creditAccount;
+            if (!account) continue;
+
+            // Match exact bank account code, or match the base account (e.g. "1920" matches "1920:10001")
+            const matchesAccount = account === bankAccountCode || 
+              account.startsWith(bankAccountCode.split(":")[0]);
+            if (!matchesAccount) continue;
+
+            bookedBankEntries.push({
+              journalEntryId: entry.journalEntryId,
+              transactionId: entry.transactionId,
+              date: entry.date || periodFrom,
+              amount: line.amount || 0,
+              amountKr: (line.amount || 0) / 100,
+              description: entry.description || "Ingen beskrivelse",
+              matched: false,
+            });
+          }
+        }
+
+        // 3. Match kontoutdrag-transaksjoner mot bokførte entries
+        const marginInOre = 500; // 5 kr margin
+        const dayMargin = 5; // 5 dager margin
+
+        const matched: Array<{
+          index: number;
+          statementDate: string;
+          statementAmount: number;
+          statementDescription: string;
+          journalEntryId: number;
+          journalDate: string;
+          journalAmount: number;
+          journalDescription: string;
+        }> = [];
+
+        const unmatched: Array<{
+          index: number;
+          date: string;
+          amount: number;
+          description: string;
+        }> = [];
+
+        for (let i = 0; i < transactions.length; i++) {
+          const txn = transactions[i];
+          const txnAmountOre = Math.round(txn.amount * 100);
+          const txnDate = new Date(txn.date);
+
+          // Find best matching booked entry (not already matched)
+          let bestMatch: (typeof bookedBankEntries)[0] | null = null;
+          let bestDateDiff = Infinity;
+
+          for (const booked of bookedBankEntries) {
+            if (booked.matched) continue;
+
+            // Check amount match (within 5 kr margin)
+            // Bank statement: negative = out, positive = in
+            // Journal entry: amount on bank account can be positive or negative
+            const amountDiff = Math.abs(Math.abs(txnAmountOre) - Math.abs(booked.amount));
+            if (amountDiff > marginInOre) continue;
+
+            // Check date match (within 5 days)
+            const bookedDate = new Date(booked.date);
+            const dateDiff = Math.abs(txnDate.getTime() - bookedDate.getTime()) / (1000 * 60 * 60 * 24);
+            if (dateDiff > dayMargin) continue;
+
+            // Pick closest date match
+            if (dateDiff < bestDateDiff) {
+              bestDateDiff = dateDiff;
+              bestMatch = booked;
+            }
+          }
+
+          if (bestMatch) {
+            bestMatch.matched = true;
+            matched.push({
+              index: i + 1,
+              statementDate: txn.date,
+              statementAmount: txn.amount,
+              statementDescription: txn.description,
+              journalEntryId: bestMatch.journalEntryId,
+              journalDate: bestMatch.date,
+              journalAmount: bestMatch.amountKr,
+              journalDescription: bestMatch.description,
+            });
+          } else {
+            unmatched.push({
+              index: i + 1,
+              date: txn.date,
+              amount: txn.amount,
+              description: txn.description,
+            });
+          }
+        }
+
+        // 4. Build summary
+        const totalCount = transactions.length;
+        const matchedCount = matched.length;
+        const unmatchedCount = unmatched.length;
+
+        const summaryLines = [
+          `Periode: ${periodFrom} til ${periodTo}`,
+          `Bankkonto: ${bankAccountCode}`,
+          `Totalt i kontoutskriften: ${totalCount} transaksjoner`,
+          `Allerede bokført (matchet): ${matchedCount}`,
+          `Trenger bokføring: ${unmatchedCount}`,
+        ];
+
+        if (unmatchedCount > 0) {
+          summaryLines.push("");
+          summaryLines.push("Transaksjoner som trenger bokføring:");
+          for (const u of unmatched) {
+            const sign = u.amount < 0 ? "ut" : "inn";
+            summaryLines.push(`  ${u.index}. ${u.date} — ${u.description} — ${Math.abs(u.amount).toFixed(2)} kr (${sign})`);
+          }
+        }
+
+        return {
+          success: true,
+          totalTransactions: totalCount,
+          matchedCount,
+          unmatchedCount,
+          matched,
+          unmatched,
+          bookedEntriesCount: bookedBankEntries.length,
+          summary: summaryLines.join("\n"),
+        };
+      } catch (error) {
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : "Kunne ikke gjennomføre avstemming",
+        };
+      }
+    },
+  });
+
+  // ============================================
+  // ATTACHMENT TOOLS
+  // ============================================
+  
+  const attachmentTools = createAttachmentTools(client, pendingFiles);
+
+  // ============================================
   // RETURN ALL TOOLS
   // ============================================
 
@@ -446,10 +646,14 @@ Søker etter transaksjoner på bankkontoer (1920-serien) innenfor dato-range og 
     
     // Avstemming
     getUnmatchedBankTransactions,
+    reconcileBankStatement,
     
     // Inbox
     searchInbox,
     getInboxDocument,
+    
+    // Attachments
+    uploadAttachmentToJournalEntry: attachmentTools.uploadAttachmentToJournalEntry,
   };
 }
 

@@ -696,6 +696,133 @@ SMART BANKKONTO-LOGIKK:
   });
 
   // ============================================
+  // UNMATCHED BANK TRANSACTIONS (Avstemming)
+  // Copied from bankAgent.ts — purchase agent prompt references this tool
+  // ============================================
+
+  const getUnmatchedBankTransactions = tool({
+    description: `Søk etter banktransaksjoner som kan matche en kvittering/utgift.
+Bruk dette FØR du registrerer et kjøp for å finne matchende banktransaksjon.
+Søker etter transaksjoner på bankkontoer (1920-serien) innenfor dato-range og beløps-margin.`,
+    parameters: z.object({
+      amount: z.number().describe("Beløp fra kvittering i KR (ikke øre). F.eks. 450 for 450 kr."),
+      date: z.string().describe("Dato fra kvittering (YYYY-MM-DD)"),
+      daysRange: z.number().optional().default(5).describe("Antall dager før/etter å søke (standard: 5)"),
+    }),
+    execute: async ({ amount, date, daysRange = 5 }) => {
+      try {
+        // 1. Beregn dato-range
+        const targetDate = new Date(date);
+        const dateFrom = new Date(targetDate);
+        dateFrom.setDate(dateFrom.getDate() - daysRange);
+        const dateTo = new Date(targetDate);
+        dateTo.setDate(dateTo.getDate() + daysRange);
+        
+        const dateFromStr = dateFrom.toISOString().split("T")[0];
+        const dateToStr = dateTo.toISOString().split("T")[0];
+        
+        // 2. Hent bankkontoer
+        const bankAccounts = await client.getBankAccounts();
+        const activeBankAccounts = bankAccounts.filter(a => !a.inactive);
+        
+        if (activeBankAccounts.length === 0) {
+          return {
+            success: false,
+            error: "Ingen aktive bankkontoer funnet i Fiken.",
+          };
+        }
+        
+        // 3. Hent journal entries (bilag) i perioden — with pagination
+        let allJournalEntries: any[] = [];
+        let page = 0;
+        const pageSize = 100;
+        while (true) {
+          const entries = await client.getJournalEntries({
+            dateGe: dateFromStr,
+            dateLe: dateToStr,
+            pageSize,
+            page,
+          });
+          allJournalEntries = allJournalEntries.concat(entries);
+          if (entries.length < pageSize) break;
+          page++;
+          if (page > 10) break; // Safety limit: max 1100 entries
+        }
+        const journalEntries = allJournalEntries;
+        
+        // 4. Konverter beløp til øre og finn margin (5 kr = 500 øre)
+        const amountInOre = amount * 100;
+        const marginInOre = 500;
+        
+        // 5. Filtrer på entries som har bankkonto og matcher beløpet
+        const matches: Array<{
+          journalEntryId: number;
+          transactionId?: number;
+          date: string;
+          amount: number;
+          amountKr: number;
+          description: string;
+          bankAccount: string;
+        }> = [];
+        
+        for (const entry of journalEntries) {
+          if (!entry.lines || !entry.journalEntryId) continue;
+          
+          for (const line of entry.lines) {
+            const account = (line as any).account || line.debitAccount || line.creditAccount;
+            if (!account || !account.startsWith("19")) continue;
+            
+            const lineAmount = line.amount || 0;
+            const absAmount = Math.abs(lineAmount);
+            
+            if (Math.abs(absAmount - amountInOre) <= marginInOre) {
+              matches.push({
+                journalEntryId: entry.journalEntryId,
+                transactionId: entry.transactionId,
+                date: entry.date || date,
+                amount: lineAmount,
+                amountKr: lineAmount / 100,
+                description: entry.description || "Ingen beskrivelse",
+                bankAccount: account,
+              });
+            }
+          }
+        }
+        
+        return {
+          success: true,
+          matchCount: matches.length,
+          matches,
+          searchCriteria: {
+            amount,
+            amountInOre,
+            targetDate: date,
+            dateFrom: dateFromStr,
+            dateTo: dateToStr,
+            marginKr: 5,
+          },
+          bankAccounts: activeBankAccounts.map(a => ({
+            id: a.bankAccountId,
+            name: a.name,
+            accountCode: a.accountCode,
+            bankAccountNumber: a.bankAccountNumber,
+          })),
+          hint: matches.length === 0
+            ? "Ingen matchende banktransaksjoner funnet. Spør bruker om utgiften er betalt eller ubetalt."
+            : matches.length === 1
+              ? "Én match funnet. Spør bruker om dette er samme kjøp."
+              : `${matches.length} potensielle matcher funnet. Vis liste og la bruker velge.`,
+        };
+      } catch (error) {
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : "Kunne ikke søke etter banktransaksjoner",
+        };
+      }
+    },
+  });
+
+  // ============================================
   // CONTACT SEARCH (for finding suppliers)
   // ============================================
 
@@ -764,6 +891,9 @@ SMART BANKKONTO-LOGIKK:
     
     // Bank accounts
     getBankAccounts,
+    
+    // Bank transaction matching (for smart bankavstemming)
+    getUnmatchedBankTransactions,
     
     // Contact search (for finding suppliers)
     searchContacts,

@@ -798,7 +798,8 @@ export interface SaleLine {
 export interface SaleLineRequest {
   description: string; // REQUIRED
   vatType: string; // REQUIRED - HIGH, MEDIUM, LOW, NONE, EXEMPT, etc.
-  netAmount?: number; // in øre
+  netPrice?: number; // in øre (Fiken API requires netPrice, NOT netAmount)
+  vat?: number; // in øre — REQUIRED when vatType is HIGH/MEDIUM/LOW (Fiken won't calculate it)
   grossAmount?: number; // in øre
   incomeAccount?: string; // e.g., "3000"
   projectId?: number;
@@ -814,6 +815,7 @@ export interface SaleRequest {
   paid: boolean; // REQUIRED
   lines: SaleLineRequest[]; // REQUIRED
   currency: string; // REQUIRED - e.g., "NOK"
+  totalPaid?: number; // in øre - REQUIRED when paid=true for NOK
   contactId?: number;
   dueDate?: string;
   paymentAccount?: string;
@@ -903,6 +905,8 @@ export interface BankAccount {
   bic?: string;
   foreignService?: string;
   type: "NORMAL" | "TAX_DEDUCTION" | "FOREIGN" | "CREDIT_CARD";
+  reconciledBalance?: number; // in øre — last reconciled balance from Fiken API
+  reconciledDate?: string; // YYYY-MM-DD — last reconciliation date
   inactive?: boolean;
 }
 
