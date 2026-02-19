@@ -142,9 +142,9 @@ export function createContactAgentTools(
   });
 
   const updateContact = tool({
-    description: "Oppdater en eksisterende kontakt i Fiken.",
+    description: "Oppdater en eksisterende kontakt i Fiken. VIKTIG: Bruk contactId (langt tall, f.eks. 11580772106), IKKE kundenummer/leverandørnummer (kort tall, f.eks. 10063). Søk først med getContacts for å finne riktig contactId.",
     parameters: z.object({
-      contactId: z.number().describe("Kontakt-ID"),
+      contactId: z.number().describe("Kontakt-ID (langt tall fra getContacts/createContact, IKKE kundenummer)"),
       name: z.string().describe("Navn på kontakten"),
       email: z.string().optional().describe("E-postadresse"),
       phoneNumber: z.string().optional().describe("Telefonnummer"),
@@ -165,6 +165,7 @@ export function createContactAgentTools(
           contact,
         };
       } catch (error) {
+        console.error(`[updateContact] Error updating contact ${contactId}:`, error instanceof Error ? error.message : error);
         return {
           success: false,
           error: error instanceof Error ? error.message : "Kunne ikke oppdatere kontakt",
@@ -174,9 +175,9 @@ export function createContactAgentTools(
   });
 
   const deleteContact = tool({
-    description: "Slett en kontakt fra Fiken. Kan kun slettes hvis kontakten ikke er brukt i transaksjoner.",
+    description: "Slett en kontakt fra Fiken. Kan kun slettes hvis kontakten ikke er brukt i transaksjoner. VIKTIG: Bruk contactId (langt tall), IKKE kundenummer.",
     parameters: z.object({
-      contactId: z.number().describe("Kontakt-ID som skal slettes"),
+      contactId: z.number().describe("Kontakt-ID (langt tall fra getContacts, IKKE kundenummer)"),
     }),
     execute: async ({ contactId }) => {
       try {
@@ -196,9 +197,9 @@ export function createContactAgentTools(
   // ============================================
 
   const getContactPersons = tool({
-    description: "Hent kontaktpersoner for en kontakt (firma).",
+    description: "Hent kontaktpersoner for en kontakt (firma). VIKTIG: Bruk contactId (langt tall), IKKE kundenummer.",
     parameters: z.object({
-      contactId: z.number().describe("Kontakt-ID"),
+      contactId: z.number().describe("Kontakt-ID (langt tall fra getContacts/createContact, IKKE kundenummer)"),
     }),
     execute: async ({ contactId }) => {
       try {
@@ -214,9 +215,9 @@ export function createContactAgentTools(
   });
 
   const addContactPerson = tool({
-    description: "Legg til en kontaktperson på en kontakt (firma). Både navn og e-post er påkrevd.",
+    description: "Legg til en kontaktperson på en kontakt (firma). Både navn og e-post er påkrevd. VIKTIG: Bruk contactId (langt tall, f.eks. 11580772106), IKKE kundenummer.",
     parameters: z.object({
-      contactId: z.number().describe("Kontakt-ID"),
+      contactId: z.number().describe("Kontakt-ID (langt tall fra getContacts/createContact, IKKE kundenummer)"),
       name: z.string().describe("Navn på kontaktpersonen"),
       email: z.string().describe("E-postadresse (påkrevd)"),
       phoneNumber: z.string().optional().describe("Telefonnummer"),
@@ -308,7 +309,7 @@ export function createContactAgentTools(
           name,
           unitPrice: unitPriceKr != null ? Math.round(unitPriceKr * 100) : undefined,
           productNumber,
-          vatType,
+          vatType: vatType.toUpperCase(),
           incomeAccount,
           active: true,
         });
@@ -335,9 +336,9 @@ export function createContactAgentTools(
   });
 
   const updateProduct = tool({
-    description: "Oppdater et eksisterende produkt i Fiken.",
+    description: "Oppdater et eksisterende produkt i Fiken. Bruk getProducts for å finne productId først.",
     parameters: z.object({
-      productId: z.number().describe("Produkt-ID"),
+      productId: z.number().describe("Produkt-ID (langt tall fra getProducts/createProduct)"),
       name: z.string().describe("Produktnavn (påkrevd)"),
       unitPriceKr: z.number().optional().describe("Enhetspris i KRONER (netto, eks mva). Bruker sier '2000 kr' → unitPriceKr = 2000. ALDRI konverter til øre!"),
       vatType: z.string().describe("MVA-type: HIGH, MEDIUM, LOW, NONE, EXEMPT, OUTSIDE"),
@@ -349,7 +350,7 @@ export function createContactAgentTools(
         const product = await client.updateProduct(productId, {
           name,
           unitPrice: unitPriceKr != null ? Math.round(unitPriceKr * 100) : undefined,
-          vatType,
+          vatType: vatType.toUpperCase(),
           incomeAccount,
           active: active ?? true,
         });
@@ -360,6 +361,7 @@ export function createContactAgentTools(
           product,
         };
       } catch (error) {
+        console.error(`[updateProduct] Error updating product ${productId}:`, error instanceof Error ? error.message : error);
         return {
           success: false,
           error: error instanceof Error ? error.message : "Kunne ikke oppdatere produkt",

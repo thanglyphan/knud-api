@@ -267,7 +267,18 @@ export function createFikenClient(accessToken: string, companySlug: string) {
       return { location, _created: true } as T;
     }
 
-    return response.json();
+    // Handle empty response bodies (common for PUT/PATCH that return 200 with no body)
+    const responseText = await response.text();
+    if (!responseText || !responseText.trim()) {
+      return {} as T;
+    }
+
+    try {
+      return JSON.parse(responseText);
+    } catch {
+      // If JSON parsing fails on a successful response, return empty object
+      return {} as T;
+    }
   }
 
   /**
