@@ -323,14 +323,14 @@ SMART BANKKONTO-LOGIKK:
             const existingSupplierId = p.supplierId || p.supplier?.contactId;
             const supplierMatch = supplierId && existingSupplierId && supplierId === existingSupplierId;
             
-            // For kontantkjøp without supplier: amount match alone is sufficient
-            // (there's no supplier to disambiguate, so same amount = likely duplicate)
-            const kontantAmountOnly = !supplierId && !existingSupplierId;
+            // For kontantkjøp without supplier: require description match too
+            // (amount match alone is too aggressive — different purchases can have similar amounts)
+            const kontantWithDescMatch = !supplierId && !existingSupplierId && descMatch;
             
-            const isDuplicate = descMatch || supplierMatch || kontantAmountOnly;
+            const isDuplicate = (descMatch && amountMatch) || supplierMatch || kontantWithDescMatch;
             
             if (isDuplicate) {
-              console.log(`[createPurchase] DUPLICATE FOUND: existing #${p.purchaseId} (${existingTotalGross} øre, desc="${existingDesc}", supplier=${existingSupplierId || 'none'}) matches new (${newTotalGross} øre, desc="${newDesc}", supplier=${supplierId || 'none'}) — reason: ${descMatch ? 'desc' : supplierMatch ? 'supplier' : 'kontant-amount'}`);
+              console.log(`[createPurchase] DUPLICATE FOUND: existing #${p.purchaseId} (${existingTotalGross} øre, desc="${existingDesc}", supplier=${existingSupplierId || 'none'}) matches new (${newTotalGross} øre, desc="${newDesc}", supplier=${supplierId || 'none'}) — reason: ${descMatch ? 'desc' : supplierMatch ? 'supplier' : 'kontant-desc'}`);
             }
             
             return isDuplicate;
@@ -341,7 +341,7 @@ SMART BANKKONTO-LOGIKK:
             const dupGross = dup.lines?.reduce((sum, l) => sum + (l.netPrice || 0) + (l.vat || 0), 0) || 0;
             return {
               success: false,
-              _operationComplete: true,
+              _operationComplete: false,
               duplicateFound: true,
               message: `⚠️ DUPLIKAT FUNNET! Et lignende kjøp finnes allerede:\n` +
                 `- ID: ${dup.purchaseId}\n` +

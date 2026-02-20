@@ -392,7 +392,7 @@ Bruk informasjon fra tidligere meldinger for å fullføre oppgaven.`,
           for (const step of (agentResult as any).steps || []) {
             for (const result of step.toolResults || []) {
               const r = result.result as Record<string, unknown> | undefined;
-              if (r && r._operationComplete) {
+              if (r && r._operationComplete && r.success !== false) {
                 completedOps.push(result.toolName as string);
                 // Track each created entity
                 if (result.toolName === 'createPurchase' && r.purchase && (r.purchase as any).purchaseId) {

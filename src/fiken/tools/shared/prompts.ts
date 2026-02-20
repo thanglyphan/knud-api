@@ -429,6 +429,10 @@ Detaljer:
 [3 kontoforslag fra suggestAccounts]
 \`\`\`
 
+⚠️ VIKTIG: I Steg 2 skal du ALDRI si "registrert", "opprettet", "bokført" eller lignende.
+Du har bare LEST informasjonen fra kvitteringen — du har IKKE kalt createPurchase ennå.
+Bruk BARE ordene "lest", "funnet", "identifisert" eller "hentet ut" i denne fasen.
+
 ### Steg 3: Vent på bekreftelse
 ALDRI registrer uten eksplisitt bekreftelse!
 
